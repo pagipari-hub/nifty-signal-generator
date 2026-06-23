@@ -50,11 +50,18 @@ def save_state(state):
 def get_current_weekly_expiry():
     """
     Returns the current weekly NIFTY expiry date.
-    VERIFY current expiry day before going live -- NSE has changed this
-    before (was Thursday, may differ by the time you read this).
+
+    IMPORTANT: NSE shifted NIFTY's weekly expiry from Thursday to TUESDAY,
+    effective September 1, 2025 (SEBI directive to spread weekly expiry
+    volume across the week). This was previously Thursday -- if NSE changes
+    it again in the future, update the weekday number below (1 = Tuesday).
+
+    Also: if the computed Tuesday is a market holiday, NSE shifts the
+    expiry to the previous trading day -- this is NOT yet handled below.
+    Check NSE's holiday calendar before relying on this near holidays.
     """
     today = dt.date.today()
-    days_ahead = (3 - today.weekday()) % 7  # 3 = Thursday
+    days_ahead = (1 - today.weekday()) % 7  # 1 = Tuesday
     return today + dt.timedelta(days=days_ahead)
 
 
