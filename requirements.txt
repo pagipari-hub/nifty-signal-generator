@@ -1,0 +1,6 @@
+smartapi-python==1.5.5
+pyotp==2.10.0
+logzero
+websocket-client
+requests
+pandas
