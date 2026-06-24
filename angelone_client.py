@@ -17,16 +17,54 @@ Credentials read from environment variables (GitHub Secrets):
 import os
 import sys
 import json
+import time
 import datetime as dt
 
 import pyotp
 import requests
 from SmartApi import SmartConnect
+from SmartApi.smartExceptions import DataException
 
 INSTRUMENT_MASTER_URL = (
     "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
 )
 INSTRUMENT_MASTER_CACHE = "instrument_master.json"
+
+# Angel One's rate limiter is known to be flakier than their published
+# limits suggest -- developers report "Access denied because of exceeding
+# access rate" even when well under the documented per-second cap. So we
+# (a) add a small delay before hitting rate-limited endpoints, and
+# (b) retry with backoff if we still get throttled.
+RATE_LIMIT_RETRY_ATTEMPTS = 3
+RATE_LIMIT_RETRY_DELAY_SECONDS = 3
+PRE_CALL_DELAY_SECONDS = 1.5
+
+
+def _call_with_retry(label, func, attempts=RATE_LIMIT_RETRY_ATTEMPTS,
+                      delay=RATE_LIMIT_RETRY_DELAY_SECONDS):
+    """
+    Calls func() and retries on Angel One rate-limit errors (DataException
+    with 'exceeding access rate' in the message, or a JSON decode failure
+    caused by the same root cause). Re-raises on the final attempt, or
+    immediately for any other kind of error.
+    """
+    last_err = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return func()
+        except DataException as e:
+            last_err = e
+            msg = str(e)
+            if "exceeding access rate" in msg.lower() or "access denied" in msg.lower():
+                print(
+                    f"{label}: rate-limited (attempt {attempt}/{attempts}): {msg}",
+                    file=sys.stderr,
+                )
+                if attempt < attempts:
+                    time.sleep(delay)
+                    continue
+            raise
+    raise last_err
 
 
 def login():
@@ -111,6 +149,10 @@ def fetch_5min_candles(smart_api, token, lookback_minutes=180):
     """
     Fetches 5-min OHLC candles for the given NFO token from Angel One.
     Returns list of dicts (oldest first): time, open, high, low, close, volume.
+
+    Retries on Angel One's rate-limit errors (these happen even within
+    documented limits -- known flakiness on their end), with a short delay
+    beforehand to reduce the odds of hitting it in the first place.
     """
     now = dt.datetime.now()
     start = now - dt.timedelta(minutes=lookback_minutes)
@@ -123,7 +165,16 @@ def fetch_5min_candles(smart_api, token, lookback_minutes=180):
         "todate": now.strftime("%Y-%m-%d %H:%M"),
     }
 
-    response = smart_api.getCandleData(params)
+    time.sleep(PRE_CALL_DELAY_SECONDS)  # breathing room after prior API calls
+
+    try:
+        response = _call_with_retry(
+            "fetch_5min_candles",
+            lambda: smart_api.getCandleData(params),
+        )
+    except DataException as e:
+        print(f"Candle fetch failed for token {token} after retries: {e}", file=sys.stderr)
+        return []
 
     if not response or not response.get("status"):
         print(f"Candle fetch failed for token {token}: {response}", file=sys.stderr)
@@ -150,8 +201,20 @@ def fetch_spot_ltp(smart_api):
     NIFTY 50 index token on NSE is 99926000 (well-known, stable Angel One
     constant -- not derived from instrument master since it's an index, not
     a tradable instrument with an expiry).
+
+    Retries on Angel One's rate-limit errors, same as fetch_5min_candles.
     """
-    response = smart_api.ltpData("NSE", "Nifty 50", "99926000")
+    time.sleep(PRE_CALL_DELAY_SECONDS)
+
+    try:
+        response = _call_with_retry(
+            "fetch_spot_ltp",
+            lambda: smart_api.ltpData("NSE", "Nifty 50", "99926000"),
+        )
+    except DataException as e:
+        print(f"Spot LTP fetch failed after retries: {e}", file=sys.stderr)
+        return None
+
     if not response or not response.get("status"):
         print(f"Spot LTP fetch failed: {response}", file=sys.stderr)
         return None
