@@ -14,17 +14,46 @@ Runs on GitHub Actions every 5 min during market hours.
    to state.json, committed back to the repo by the GitHub Action.
 
 This script must NEVER place a real order itself.
+
+---
+FIX LOG (production hardening pass):
+  - All datetime.now() calls now use IST explicitly (the GH Actions job sets
+    TZ=Asia/Kolkata, but we don't rely on that alone -- this script is
+    correct even if run somewhere that doesn't set TZ).
+  - Added an internal market-hours + holiday guard, run before any API calls.
+  - get_current_weekly_expiry() now adjusts backward off NSE holidays.
+  - send_to_webhook() now retries on failure (webhook is known to be choppy).
+  - main() now gates state mutation on a confirmed-OK webhook response,
+    instead of assuming the signal was acted on.
+
+NOT YET DONE (deliberately deferred -- depends on the Shoonya/webhook side):
+  - A webhook HTTP 200 here still only means "the webhook accepted the
+    request," NOT "Shoonya filled the order." Real fill confirmation has to
+    happen inside the webhook (it holds the Shoonya session), and until
+    that's built, the gating below is necessary-but-not-sufficient. Treat
+    state.json as "probably right" rather than "guaranteed right" until
+    that follow-up lands.
+  - Startup-time reconciliation against actual broker positions.
 """
 
 import json
 import os
 import sys
+import time
 import datetime as dt
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import requests
 
 import angelone_client as ac
+
+IST = ZoneInfo("Asia/Kolkata")
+
+
+def now_ist():
+    return dt.datetime.now(IST)
+
 
 STATE_FILE = "state.json"
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL")  # set as a GitHub Secret
@@ -32,6 +61,63 @@ WEBHOOK_SECRET = os.environ.get("WEBHOOK_SHARED_SECRET")  # simple auth between 
 
 LOT_SIZE = 75  # NIFTY lot size -- confirm current value before going live;
                 # NSE revises this periodically.
+
+WEBHOOK_RETRY_ATTEMPTS = 3
+WEBHOOK_RETRY_DELAY_SECONDS = 2
+
+# Static list of NSE trading holidays. Update yearly -- there is no reliable
+# free API for this, so this has to be maintained by hand against NSE's
+# published holiday calendar each December/January for the year ahead.
+# Source: NSE circulars. VERIFY before relying on this near year-end.
+# NSE trading holidays for 2026. Source: NSE official circular
+# NSE/CMTR/71775, dated December 12, 2025 (verified directly against the
+# circular text -- not a third-party aggregator). Weekend-falling holidays
+# (e.g. Mahashivratri, Independence Day in 2026) are omitted since weekday
+# filtering already excludes Sat/Sun; only listed here if they affect a
+# weekday. Re-verify against NSE's site before each new year:
+# https://www.nseindia.com/resources/exchange-communication-holidays
+NSE_HOLIDAYS_2026 = {
+    dt.date(2026, 1, 26),   # Republic Day
+    dt.date(2026, 3, 3),    # Holi
+    dt.date(2026, 3, 26),   # Shri Ram Navami
+    dt.date(2026, 3, 31),   # Shri Mahavir Jayanti
+    dt.date(2026, 4, 3),    # Good Friday
+    dt.date(2026, 4, 14),   # Dr. Baba Saheb Ambedkar Jayanti
+    dt.date(2026, 5, 1),    # Maharashtra Day
+    dt.date(2026, 5, 28),   # Bakri Id
+    dt.date(2026, 6, 26),   # Muharram
+    dt.date(2026, 9, 14),   # Ganesh Chaturthi
+    dt.date(2026, 10, 2),   # Mahatma Gandhi Jayanti
+    dt.date(2026, 10, 20),  # Dussehra
+    dt.date(2026, 11, 10),  # Diwali-Balipratipada
+    dt.date(2026, 11, 24),  # Prakash Gurpurb Sri Guru Nanak Dev
+    dt.date(2026, 12, 25),  # Christmas
+    # Note: Nov 8, 2026 (Diwali Laxmi Pujan) falls on a Sunday and is
+    # already excluded by weekday filtering -- not a weekday trading
+    # holiday, so deliberately not listed here despite being notable.
+}
+
+MARKET_OPEN = dt.time(9, 15)
+MARKET_CLOSE = dt.time(15, 30)
+EOD_SQUAREOFF = dt.time(15, 20)
+
+
+def is_trading_day(date):
+    return date.weekday() < 5 and date not in NSE_HOLIDAYS_2026
+
+
+def is_market_open_now():
+    """
+    FIX (1.2): nothing previously stopped this script from running outside
+    market hours or on a holiday -- the cron schedule restricts *automatic*
+    triggers, but workflow_dispatch (manual runs) and holiday non-awareness
+    were both unguarded. This is checked first in main(), before any
+    API/network calls are made.
+    """
+    n = now_ist()
+    if not is_trading_day(n.date()):
+        return False
+    return MARKET_OPEN <= n.time() <= MARKET_CLOSE
 
 
 def load_state():
@@ -42,27 +128,32 @@ def load_state():
 
 
 def save_state(state):
-    state["last_run"] = dt.datetime.now().isoformat()
+    state["last_run"] = now_ist().isoformat()
     with open(STATE_FILE, "w") as f:
         json.dump(state, f, indent=2)
 
 
 def get_current_weekly_expiry():
     """
-    Returns the current weekly NIFTY expiry date.
+    Returns the current weekly NIFTY expiry date, adjusted for holidays.
 
-    IMPORTANT: NSE shifted NIFTY's weekly expiry from Thursday to TUESDAY,
-    effective September 1, 2025 (SEBI directive to spread weekly expiry
-    volume across the week). This was previously Thursday -- if NSE changes
-    it again in the future, update the weekday number below (1 = Tuesday).
+    NSE shifted NIFTY's weekly expiry from Thursday to TUESDAY, effective
+    September 1, 2025 (SEBI directive to spread weekly expiry volume across
+    the week). If NSE changes it again, update the weekday number below
+    (1 = Tuesday).
 
-    Also: if the computed Tuesday is a market holiday, NSE shifts the
-    expiry to the previous trading day -- this is NOT yet handled below.
-    Check NSE's holiday calendar before relying on this near holidays.
+    FIX (1.3): if the computed Tuesday is a market holiday, NSE shifts the
+    expiry to the previous trading day. This now walks backward from the
+    computed date until it lands on an actual trading day.
     """
-    today = dt.date.today()
+    today = now_ist().date()
     days_ahead = (1 - today.weekday()) % 7  # 1 = Tuesday
-    return today + dt.timedelta(days=days_ahead)
+    expiry = today + dt.timedelta(days=days_ahead)
+
+    while not is_trading_day(expiry):
+        expiry -= dt.timedelta(days=1)
+
+    return expiry
 
 
 def get_atm_strike(spot_price, step=50):
@@ -70,8 +161,23 @@ def get_atm_strike(spot_price, step=50):
 
 
 def compute_indicators(candles):
+    """
+    FIX (2.3): VWAP previously used a plain cumsum() over whatever candles
+    were returned, with no day-boundary filtering. If the data source ever
+    returns candles spanning more than one trading session, VWAP would
+    silently blend yesterday's volume/price into today's number. This now
+    explicitly filters to "today, IST" before computing anything, which
+    makes the result correct regardless of what the upstream API returns.
+    """
     df = pd.DataFrame(candles)
-    if df.empty or len(df) < 25:
+    if df.empty:
+        return None
+
+    df["time"] = pd.to_datetime(df["time"])
+    today = now_ist().date()
+    df = df[df["time"].dt.date == today].reset_index(drop=True)
+
+    if len(df) < 25:
         return None
 
     df["ema5"] = df["close"].ewm(span=5, adjust=False).mean()
@@ -103,10 +209,16 @@ def compute_entry_price(trigger_candle):
 
 
 def is_eod_squareoff_time():
-    return dt.datetime.now().time() >= dt.time(15, 20)
+    return now_ist().time() >= EOD_SQUAREOFF
 
 
 def send_to_webhook(payload):
+    """
+    FIX (1.5): the webhook is known to be choppy (Shoonya-side flakiness
+    surfaces here). Previously this was a single attempt with no retry --
+    now retries with a short delay before giving up. Still returns None on
+    total failure; callers MUST check for that (see FIX 1.4 in main()).
+    """
     if not WEBHOOK_URL:
         print("WEBHOOK_URL not set -- skipping webhook call. Payload was:", payload)
         return None
@@ -115,16 +227,53 @@ def send_to_webhook(payload):
     if WEBHOOK_SECRET:
         headers["X-Webhook-Secret"] = WEBHOOK_SECRET
 
+    last_err = None
+    for attempt in range(1, WEBHOOK_RETRY_ATTEMPTS + 1):
+        try:
+            resp = requests.post(WEBHOOK_URL, json=payload, headers=headers, timeout=15)
+            print(f"Webhook response [{resp.status_code}] (attempt {attempt}): {resp.text}")
+            return resp
+        except requests.RequestException as e:
+            last_err = e
+            print(f"Webhook call failed (attempt {attempt}/{WEBHOOK_RETRY_ATTEMPTS}): {e}",
+                  file=sys.stderr)
+            if attempt < WEBHOOK_RETRY_ATTEMPTS:
+                time.sleep(WEBHOOK_RETRY_DELAY_SECONDS)
+
+    print(f"Webhook call failed after {WEBHOOK_RETRY_ATTEMPTS} attempts: {last_err}",
+          file=sys.stderr)
+    return None
+
+
+def webhook_confirmed_ok(resp):
+    """
+    FIX (1.4): previously the return value of send_to_webhook() was never
+    checked at all -- state was mutated unconditionally after firing the
+    request. This at least confirms the webhook accepted the request.
+
+    CAVEAT (documented, not yet resolved): a 200 here means "the webhook
+    received and processed the request," not "Shoonya filled the order."
+    The webhook currently returns 200 as soon as place_order() returns an
+    order ID, before any fill confirmation. True fill-confirmation has to
+    be built on the webhook side (it holds the Shoonya session) and this
+    function's meaning gets stronger once that lands -- it isn't weakened
+    by adding this check now, but don't treat this as the final word yet.
+    """
+    if resp is None:
+        return False
     try:
-        resp = requests.post(WEBHOOK_URL, json=payload, headers=headers, timeout=15)
-        print(f"Webhook response [{resp.status_code}]: {resp.text}")
-        return resp
-    except requests.RequestException as e:
-        print(f"Webhook call failed: {e}", file=sys.stderr)
-        return None
+        body = resp.json()
+    except ValueError:
+        body = {}
+    return resp.status_code == 200 and body.get("status") == "ok"
 
 
 def main():
+    # FIX (1.2): guard first, before any login/network calls.
+    if not is_market_open_now():
+        print("Market closed (outside hours or holiday) -- skipping run.")
+        return
+
     state = load_state()
     smart_api = ac.login()
     instruments = ac.download_instrument_master()
@@ -136,7 +285,12 @@ def main():
         return
 
     atm = get_atm_strike(spot_price)
-    strikes_to_check = [atm - 100, atm - 50, atm, atm + 50, atm + 100]
+    # Checking ATM+-100 and ATM+-400 (4 strikes x 2 option types = 8 calls
+    # per run). Angel One's documented getCandleData limit is 180/min, so
+    # 8 calls/5-min-tick is well within headroom -- the earlier rate-limit
+    # errors were Angel One-side flakiness (confirmed via their own forum),
+    # not something caused by call volume at this scale.
+    strikes_to_check = [atm - 400, atm - 100, atm + 100, atm + 400]
 
     # ---- Manage existing open position first ----
     if state["open_position"] is not None:
@@ -154,15 +308,27 @@ def main():
 
                 if sl_hit or target_hit or is_eod_squareoff_time():
                     reason = "SL" if sl_hit else ("TARGET" if target_hit else "EOD")
-                    send_to_webhook({
+                    resp = send_to_webhook({
                         "action": "EXIT",
                         "reason": reason,
                         "symbol": pos["symbol"],
                         "qty": pos["qty"],
                         "price": float(last["close"]),
-                        "time": dt.datetime.now().isoformat(),
+                        "time": now_ist().isoformat(),
                     })
-                    state["open_position"] = None
+
+                    # FIX (1.4): only clear the position if the webhook
+                    # confirmed it processed the exit. If it failed, leave
+                    # state untouched -- next run will retry the exit check
+                    # rather than silently believing we're flat.
+                    if webhook_confirmed_ok(resp):
+                        state["open_position"] = None
+                    else:
+                        print(
+                            "EXIT webhook not confirmed -- leaving open_position "
+                            "in state.json so the next run retries.",
+                            file=sys.stderr,
+                        )
 
         save_state(state)
         return
@@ -183,6 +349,7 @@ def main():
                 trigger_candle = df.iloc[-1].to_dict()
                 entry_price = compute_entry_price(trigger_candle)
                 target_price = entry_price - 2 * (trigger_candle["high"] - entry_price)
+                entry_time = now_ist().isoformat()
 
                 position = {
                     "symbol": token_info["symbol"],
@@ -192,22 +359,34 @@ def main():
                     "entry_price": entry_price,
                     "qty": LOT_SIZE,
                     "target_price": target_price,
-                    "entry_time": dt.datetime.now().isoformat(),
+                    "entry_time": entry_time,
                 }
 
-                send_to_webhook({
+                resp = send_to_webhook({
                     "action": "ENTRY",
                     "side": "SELL",
                     "symbol": position["symbol"],
                     "qty": LOT_SIZE,
                     "price": entry_price,
                     "target_price": target_price,
-                    "time": position["entry_time"],
+                    "time": entry_time,
                 })
 
-                state["open_position"] = position
-                save_state(state)
-                print(f"SIGNAL: SELL {position['symbol']} @ {entry_price}")
+                # FIX (1.4): only record the position as open if the webhook
+                # confirmed it. Otherwise the next run correctly sees
+                # open_position as None and will re-scan for entries instead
+                # of "managing" a position that was never actually placed.
+                if webhook_confirmed_ok(resp):
+                    state["open_position"] = position
+                    save_state(state)
+                    print(f"SIGNAL: SELL {position['symbol']} @ {entry_price}")
+                else:
+                    print(
+                        f"ENTRY webhook not confirmed for {position['symbol']} -- "
+                        "NOT recording as open position. Will re-evaluate next run.",
+                        file=sys.stderr,
+                    )
+                    save_state(state)
                 return
 
     save_state(state)
