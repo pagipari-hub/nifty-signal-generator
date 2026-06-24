@@ -106,6 +106,20 @@ def is_trading_day(date):
     return date.weekday() < 5 and date not in NSE_HOLIDAYS_2026
 
 
+def previous_trading_day(date):
+    """
+    Walks backward from `date` to find the most recent prior trading day
+    (skips weekends and NSE holidays). Used so EMA5/EMA25 can warm up using
+    real history from the last session, instead of restarting cold every
+    morning -- VWAP still resets at today's market open separately, since
+    that's how VWAP is correctly defined.
+    """
+    d = date - dt.timedelta(days=1)
+    while not is_trading_day(d):
+        d -= dt.timedelta(days=1)
+    return d
+
+
 def is_market_open_now():
     """
     FIX (1.2): nothing previously stopped this script from running outside
@@ -162,31 +176,50 @@ def get_atm_strike(spot_price, step=50):
 
 def compute_indicators(candles):
     """
-    FIX (2.3): VWAP previously used a plain cumsum() over whatever candles
-    were returned, with no day-boundary filtering. If the data source ever
-    returns candles spanning more than one trading session, VWAP would
-    silently blend yesterday's volume/price into today's number. This now
-    explicitly filters to "today, IST" before computing anything, which
-    makes the result correct regardless of what the upstream API returns.
+    FIX (2.3, extended): VWAP must reset at today's market open -- that part
+    was already fixed and is unchanged below. But EMA5/EMA25 should NOT
+    reset daily; restarting them cold every morning means the first ~2+
+    hours of every session have an EMA25 that's still mostly seed-value,
+    not a real 25-period average, so the strategy was effectively blind to
+    entry signals until ~11:30 AM most days.
+
+    Fix: EMA5/EMA25 are computed across the FULL fetched range (today +
+    previous trading day, see previous_trading_day() and how main() calls
+    fetch_5min_candles), so they're already warmed up by today's market
+    open. VWAP is still computed only on today's rows. The returned
+    DataFrame contains only today's rows, with EMA values carried forward
+    correctly and VWAP correctly session-anchored.
     """
     df = pd.DataFrame(candles)
     if df.empty:
         return None
 
     df["time"] = pd.to_datetime(df["time"])
+    df = df.sort_values("time").reset_index(drop=True)
+
     today = now_ist().date()
-    df = df[df["time"].dt.date == today].reset_index(drop=True)
 
-    if len(df) < 25:
-        return None
-
+    # EMA needs the full range (includes previous trading day) to be
+    # properly warmed up by the time today's session starts.
     df["ema5"] = df["close"].ewm(span=5, adjust=False).mean()
     df["ema25"] = df["close"].ewm(span=25, adjust=False).mean()
 
+    # VWAP must only accumulate from today's market open -- zero out
+    # contribution from any prior-day rows before the cumulative sum.
+    today_mask = df["time"].dt.date == today
     typical_price = (df["high"] + df["low"] + df["close"]) / 3
-    df["cum_vol"] = df["volume"].cumsum()
-    df["cum_tp_vol"] = (typical_price * df["volume"]).cumsum()
-    df["vwap"] = df["cum_tp_vol"] / df["cum_vol"]
+    cum_vol = df["volume"].where(today_mask, 0).cumsum()
+    cum_tp_vol = (typical_price * df["volume"]).where(today_mask, 0).cumsum()
+    df["vwap"] = cum_tp_vol / cum_vol.replace(0, pd.NA)
+
+    # Only today's rows are relevant for signal-checking from here on --
+    # previous-day rows were only needed to warm up EMA.
+    df = df[today_mask].reset_index(drop=True)
+
+    if len(df) < 2:
+        # Not enough of today's session yet to check a signal meaningfully,
+        # even though EMA itself is already warmed up from yesterday.
+        return None
 
     return df
 
@@ -284,6 +317,15 @@ def main():
         print("Could not fetch spot price, aborting this run.", file=sys.stderr)
         return
 
+    # FIX (EMA warm-up): fetch candles starting from the PREVIOUS trading
+    # day's market open, not just a rolling lookback window, so EMA5/EMA25
+    # have real history to converge against instead of restarting cold
+    # every morning. VWAP still resets at today's open (handled inside
+    # compute_indicators) -- this only affects how far back we ask Angel
+    # One for data.
+    prev_day = previous_trading_day(now_ist().date())
+    candle_start = dt.datetime.combine(prev_day, MARKET_OPEN)
+
     atm = get_atm_strike(spot_price)
     # Checking ATM+-100 and ATM+-400 (4 strikes x 2 option types = 8 calls
     # per run). Angel One's documented getCandleData limit is 180/min, so
@@ -298,7 +340,7 @@ def main():
         token_info = ac.resolve_option_token(instruments, expiry, pos["strike"], pos["option_type"])
 
         if token_info:
-            candles = ac.fetch_5min_candles(smart_api, token_info["token"])
+            candles = ac.fetch_5min_candles(smart_api, token_info["token"], start_time=candle_start)
             df = compute_indicators(candles)
 
             if df is not None:
@@ -340,7 +382,7 @@ def main():
             if not token_info:
                 continue
 
-            candles = ac.fetch_5min_candles(smart_api, token_info["token"])
+            candles = ac.fetch_5min_candles(smart_api, token_info["token"], start_time=candle_start)
             df = compute_indicators(candles)
             if df is None:
                 continue
