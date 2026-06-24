@@ -145,17 +145,22 @@ def resolve_option_token(instruments, expiry_date, strike, option_type):
     return None
 
 
-def fetch_5min_candles(smart_api, token, lookback_minutes=180):
+def fetch_5min_candles(smart_api, token, start_time=None, lookback_minutes=180):
     """
     Fetches 5-min OHLC candles for the given NFO token from Angel One.
     Returns list of dicts (oldest first): time, open, high, low, close, volume.
+
+    start_time: explicit datetime to fetch from (e.g. previous trading day's
+    market open), so EMA indicators have real history to warm up against
+    instead of restarting cold every morning. If not given, falls back to
+    a simple rolling lookback_minutes window (legacy behaviour).
 
     Retries on Angel One's rate-limit errors (these happen even within
     documented limits -- known flakiness on their end), with a short delay
     beforehand to reduce the odds of hitting it in the first place.
     """
     now = dt.datetime.now()
-    start = now - dt.timedelta(minutes=lookback_minutes)
+    start = start_time if start_time is not None else now - dt.timedelta(minutes=lookback_minutes)
 
     params = {
         "exchange": "NFO",
