@@ -102,6 +102,70 @@ MARKET_CLOSE = dt.time(15, 30)
 EOD_SQUAREOFF = dt.time(15, 20)
 
 
+PREV_DAY_CACHE_FILE = "prev_day_candles.json"
+
+
+def load_prev_day_cache(expected_date):
+    """
+    Loads the cached previous-trading-day candles, keyed by token. Returns
+    an empty dict if the cache file doesn't exist, is unreadable, or was
+    built for a different date than expected_date (e.g. it's a new day, so
+    yesterday's cache is now stale and needs replacing).
+
+    This exists so we fetch each previous-day session from Angel One only
+    ONCE (the first run of the day, per token), instead of re-downloading
+    a 2-day candle range on every single 5-min tick -- which is what was
+    causing repeated rate-limit errors after the EMA warm-up fix increased
+    the per-call payload size.
+    """
+    if not os.path.exists(PREV_DAY_CACHE_FILE):
+        return {}
+    try:
+        with open(PREV_DAY_CACHE_FILE, "r") as f:
+            cache = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+    if cache.get("date") != expected_date.isoformat():
+        return {}  # stale -- different trading day than expected
+    return cache.get("candles_by_token", {})
+
+
+def save_prev_day_cache(date, candles_by_token):
+    with open(PREV_DAY_CACHE_FILE, "w") as f:
+        json.dump({"date": date.isoformat(), "candles_by_token": candles_by_token}, f)
+
+
+def get_candles_with_cache(smart_api, token, prev_day, prev_day_cache, today_start):
+    """
+    Returns combined (previous trading day + today) candles for `token`,
+    fetching only what's not already cached:
+      - Previous day's candles: served from prev_day_cache if present for
+        this token; otherwise fetched once (just that one day's session,
+        not a 2-day range) and added to the cache dict (caller is
+        responsible for persisting it back to disk at the end of the run).
+      - Today's candles: always fetched fresh (small, cheap -- just since
+        today's market open, not 2 days), since they change every run.
+    """
+    token_str = str(token)
+
+    if token_str in prev_day_cache:
+        prev_candles = prev_day_cache[token_str]
+    else:
+        prev_day_start = dt.datetime.combine(prev_day, MARKET_OPEN)
+        prev_candles = ac.fetch_5min_candles(smart_api, token, start_time=prev_day_start)
+        prev_day_cache[token_str] = prev_candles
+
+    today_candles = ac.fetch_5min_candles(smart_api, token, start_time=today_start)
+
+    # Avoid double-counting if Angel One's "previous day" response happens
+    # to include any of today's candles (shouldn't, given the date-bounded
+    # query, but de-dupe by timestamp defensively).
+    seen_times = {c["time"] for c in prev_candles}
+    merged = list(prev_candles) + [c for c in today_candles if c["time"] not in seen_times]
+    return merged
+
+
 def is_trading_day(date):
     return date.weekday() < 5 and date not in NSE_HOLIDAYS_2026
 
@@ -351,14 +415,16 @@ def main():
         print("Could not fetch spot price, aborting this run.", file=sys.stderr)
         return
 
-    # FIX (EMA warm-up): fetch candles starting from the PREVIOUS trading
-    # day's market open, not just a rolling lookback window, so EMA5/EMA25
-    # have real history to converge against instead of restarting cold
-    # every morning. VWAP still resets at today's open (handled inside
-    # compute_indicators) -- this only affects how far back we ask Angel
-    # One for data.
+    # FIX (rate-limit regression): previously we asked Angel One for the
+    # full previous-day + today range on EVERY call (8 calls/run), which
+    # made each call heavier and triggered repeated rate-limit failures
+    # that exhausted all retries. Now: previous day's candles are fetched
+    # ONCE per day (cached to disk, see load_prev_day_cache), and each run
+    # only fetches today's (small, cheap) candles fresh, then merges with
+    # the cached previous-day data in memory for EMA warm-up.
     prev_day = previous_trading_day(now_ist().date())
-    candle_start = dt.datetime.combine(prev_day, MARKET_OPEN)
+    prev_day_cache = load_prev_day_cache(prev_day)
+    today_start = dt.datetime.combine(now_ist().date(), MARKET_OPEN)
 
     atm = get_atm_strike(spot_price)
     # Checking ATM+-100 and ATM+-400 (4 strikes x 2 option types = 8 calls
@@ -374,7 +440,7 @@ def main():
         token_info = ac.resolve_option_token(instruments, expiry, pos["strike"], pos["option_type"])
 
         if token_info:
-            candles = ac.fetch_5min_candles(smart_api, token_info["token"], start_time=candle_start)
+            candles = get_candles_with_cache(smart_api, token_info["token"], prev_day, prev_day_cache, today_start)
             df = compute_indicators(candles)
 
             if df is not None:
@@ -407,6 +473,7 @@ def main():
                         )
 
         save_state(state)
+        save_prev_day_cache(prev_day, prev_day_cache)
         return
 
     # ---- No open position: look for a new entry signal ----
@@ -416,7 +483,7 @@ def main():
             if not token_info:
                 continue
 
-            candles = ac.fetch_5min_candles(smart_api, token_info["token"], start_time=candle_start)
+            candles = get_candles_with_cache(smart_api, token_info["token"], prev_day, prev_day_cache, today_start)
             df = compute_indicators(candles)
             if df is None:
                 continue
@@ -463,9 +530,11 @@ def main():
                         file=sys.stderr,
                     )
                     save_state(state)
+                save_prev_day_cache(prev_day, prev_day_cache)
                 return
 
     save_state(state)
+    save_prev_day_cache(prev_day, prev_day_cache)
     print("No entry signal this run.")
 
 
