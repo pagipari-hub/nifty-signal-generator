@@ -1,5 +1,5 @@
 name: NIFTY Weekly Options - Signal Generator (Angel One data)
-# schedule re-sync trigger - 2026-06-25
+# schedule re-sync trigger - 2026-06-24
 on:
   schedule:
     - cron: "45,50,55 3 * * 1-5"        # 09:15,09:20,09:25 IST
@@ -10,11 +10,28 @@ on:
 permissions:
   contents: write
 
+# FIX (1.7): without this, a slow run (rate-limit retries, broker latency)
+# can still be executing when the next 5-min cron tick fires. Two overlapping
+# runs both read state.json as "no open position" and could both fire an
+# entry -- this is the duplicate-entry risk. `cancel-in-progress: false`
+# is intentional: we want the in-flight run to finish managing whatever it's
+# doing, not get killed mid-way through an exit/entry decision. The new run
+# will simply queue and run after, picking up the now-current state.json.
+concurrency:
+  group: nifty-signal-generator
+  cancel-in-progress: false
+
 jobs:
   generate-signal:
     runs-on: ubuntu-latest
     timeout-minutes: 4
-
+    # FIX (1.1): the workflow's cron triggers are correctly converted to IST,
+    # but strategy.py's own datetime.now() calls were still naive UTC. Setting
+    # TZ here makes datetime.now() return IST directly inside the job, so the
+    # EOD square-off check (15:20 IST) and all state/webhook timestamps are
+    # correct without needing zoneinfo plumbing through every call site.
+    env:
+      TZ: Asia/Kolkata
     steps:
       - name: Check out repo
         uses: actions/checkout@v4
@@ -27,7 +44,22 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      # FIX (2.1): instrument_master.json was never persisted between runs
+      # (fresh checkout every time), so angelone_client.py's same-day cache
+      # check always missed and the file was re-downloaded on every single
+      # invocation (~75x/day on this schedule). Cache keyed on the IST date
+      # so it naturally invalidates once per trading day.
+      - name: Restore instrument master cache
+        id: date
+        run: echo "today=$(date +'%Y-%m-%d')" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/cache@v4
+        with:
+          path: instrument_master.json
+          key: instrument-master-${{ steps.date.outputs.today }}
+
       - name: Run signal generation
+        id: run_strategy
         env:
           ANGEL_CLIENT_CODE: ${{ secrets.ANGEL_CLIENT_CODE }}
           ANGEL_PASSWORD: ${{ secrets.ANGEL_PASSWORD }}
@@ -37,10 +69,51 @@ jobs:
           WEBHOOK_SHARED_SECRET: ${{ secrets.WEBHOOK_SHARED_SECRET }}
         run: python strategy.py
 
+      # FIX (alerting): previously a crashed run was silent -- the only way
+      # to find out was manually opening the Actions tab. This fires ONLY
+      # when the step above failed (`if: failure()`), pinging the same
+      # Telegram bot already used for trade alerts so a crash is never
+      # missed during market hours. Requires TELEGRAM_BOT_TOKEN and
+      # TELEGRAM_CHAT_ID to be added as repo secrets (Settings > Secrets
+      # and variables > Actions) -- they currently only exist on Render.
+      - name: Alert on failure
+        if: failure()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          MSG="⚠️ NIFTY signal-generator run FAILED at $(date '+%Y-%m-%d %H:%M:%S %Z'). Check GitHub Actions logs: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d chat_id="${TELEGRAM_CHAT_ID}" \
+            -d text="$MSG" \
+            || echo "Failed to send Telegram alert (non-fatal, won't block the job)."
+
       - name: Commit updated state back to repo
         run: |
           git config user.name "signal-bot"
           git config user.email "actions@github.com"
-          git add state.json 2>/dev/null || true
-          git diff --quiet --cached || git commit -m "Update state [skip ci]"
-          git push || echo "Nothing to push"
+          git add state.json prev_day_candles.json 2>/dev/null || true
+
+          # Track whether this run actually created a commit, so we know
+          # afterward whether a push failure is real or a harmless no-op.
+          COMMITTED=false
+          if ! git diff --quiet --cached; then
+            git commit -m "Update state [skip ci]"
+            COMMITTED=true
+          fi
+
+          # FIX (1.8): the old `git push || echo "Nothing to push"` swallowed
+          # ALL push failures identically, including real conflicts (e.g. two
+          # overlapping runs both committing). A genuine state-sync failure
+          # would print a harmless-looking message and the job would still go
+          # green -- no signal in the Actions UI that anything was wrong.
+          # Now: a push failure after we DID commit something is a real
+          # problem (most likely a remote conflict) and fails the job loudly.
+          # A push failure when we committed nothing is a true no-op.
+          if ! git push; then
+            if [ "$COMMITTED" = "true" ]; then
+              echo "::error::git push failed after committing state.json changes -- state may be out of sync. Likely a remote conflict (e.g. overlapping runs); pull and inspect state.json manually."
+              exit 1
+            fi
+            echo "Nothing to push."
+          fi
