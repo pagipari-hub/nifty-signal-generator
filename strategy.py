@@ -138,13 +138,44 @@ def load_state():
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE, "r") as f:
             return json.load(f)
-    return {"open_position": None, "last_run": None}
+    return {"open_position": None, "last_run": None, "heartbeat_date": None}
 
 
 def save_state(state):
     state["last_run"] = now_ist().isoformat()
     with open(STATE_FILE, "w") as f:
         json.dump(state, f, indent=2)
+
+
+def send_heartbeat_if_needed(state):
+    """
+    Sends a one-line 'I'm alive' heartbeat through the webhook (which relays
+    it to Telegram) once per trading day, on whichever run is the first one
+    to successfully reach this point that day.
+
+    Why this matters: GitHub Actions scheduled workflows can silently fail
+    to fire at all (known platform-side flakiness, not specific to this
+    repo -- see e.g. github.com/orgs/community/discussions/185024). When
+    that happens, there's no error and no log -- the job just never starts.
+    A missing heartbeat by ~9:20 AM is the signal to check the Actions tab
+    and, if needed, push a trivial commit to .github/workflows/ to force
+    GitHub to resync the schedule.
+
+    This does NOT detect every failure mode (e.g. it can't warn you if the
+    very first run of the day is the one that fails to fire), but it does
+    catch the much more common case of "the schedule silently stopped
+    firing entirely partway through the morning."
+    """
+    today_str = now_ist().date().isoformat()
+    if state.get("heartbeat_date") == today_str:
+        return  # already sent today
+
+    send_to_webhook({
+        "action": "HEARTBEAT",
+        "message": f"Signal generator alive -- first successful run today at {now_ist().strftime('%H:%M:%S')} IST.",
+        "time": now_ist().isoformat(),
+    })
+    state["heartbeat_date"] = today_str
 
 
 def get_current_weekly_expiry():
@@ -308,6 +339,9 @@ def main():
         return
 
     state = load_state()
+    send_heartbeat_if_needed(state)
+    save_state(state)  # persist heartbeat_date immediately, don't wait for end of run
+
     smart_api = ac.login()
     instruments = ac.download_instrument_master()
 
