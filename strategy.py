@@ -202,13 +202,61 @@ def load_state():
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE, "r") as f:
             return json.load(f)
-    return {"open_position": None, "last_run": None, "heartbeat_date": None}
+    return {
+        "open_position": None,
+        "last_run": None,
+        "heartbeat_date": None,
+        "daily_strikes_date": None,
+        "daily_atm": None,
+        "daily_strikes": None,
+    }
 
 
 def save_state(state):
     state["last_run"] = now_ist().isoformat()
     with open(STATE_FILE, "w") as f:
         json.dump(state, f, indent=2)
+
+
+def get_or_set_daily_strikes(state, smart_api):
+    """
+    The strategy's design intent is that today's strikes are anchored to
+    the SPOT PRICE AT THE FIRST RUN OF THE DAY (~9:15-9:30 AM), not
+    recalculated every 5 minutes. The strategy sells premium on whichever
+    side benefits from the day's move relative to that morning reference
+    point -- if spot rises from there, sell puts; if it falls, sell calls
+    -- so the strikes themselves must stay fixed all day for that logic to
+    mean what it's supposed to mean. Recalculating ATM every run would
+    chase a moving target and break this.
+
+    Snapshots ATM (and the 4 strikes derived from it) once, on the first
+    run of each trading day, and persists it in state.json so every later
+    run that day reuses the SAME strikes regardless of how much spot
+    drifts afterward. Returns (atm, strikes_to_check, spot_price_at_lock).
+
+    If today's snapshot already exists, returns it without calling
+    fetch_spot_ltp again -- saves an API call on every run after the first.
+    spot_price_at_lock is only non-None on the run that actually set it
+    (useful for logging); later runs return None for that third value
+    since they didn't re-fetch it.
+    """
+    today_str = now_ist().date().isoformat()
+
+    if state.get("daily_strikes_date") == today_str and state.get("daily_strikes"):
+        return state["daily_atm"], state["daily_strikes"], None
+
+    spot_price = ac.fetch_spot_ltp(smart_api)
+    if spot_price is None:
+        return None, None, None
+
+    atm = get_atm_strike(spot_price)
+    strikes = [atm - 400, atm - 100, atm + 100, atm + 400]
+
+    state["daily_strikes_date"] = today_str
+    state["daily_atm"] = atm
+    state["daily_strikes"] = strikes
+
+    return atm, strikes, spot_price
 
 
 def send_heartbeat_if_needed(state):
@@ -410,10 +458,18 @@ def main():
     instruments = ac.download_instrument_master()
 
     expiry = get_current_weekly_expiry()
-    spot_price = ac.fetch_spot_ltp(smart_api)
-    if spot_price is None:
-        print("Could not fetch spot price, aborting this run.", file=sys.stderr)
+
+    # FIX (strike-locking, per strategy design intent): strikes are
+    # anchored to spot price at the FIRST run of the day (~9:15-9:30 AM),
+    # not recalculated every 5 minutes -- the strategy's logic depends on
+    # the day's move being measured relative to that fixed morning
+    # reference point. See get_or_set_daily_strikes() for the full reason.
+    atm, strikes_to_check, spot_price_at_lock = get_or_set_daily_strikes(state, smart_api)
+    if atm is None:
+        print("Could not fetch spot price to lock today's strikes, aborting this run.", file=sys.stderr)
         return
+    if spot_price_at_lock is not None:
+        print(f"Locked today's strikes: ATM={atm} (spot={spot_price_at_lock}) -> {strikes_to_check}")
 
     # FIX (rate-limit regression): previously we asked Angel One for the
     # full previous-day + today range on EVERY call (8 calls/run), which
@@ -426,13 +482,7 @@ def main():
     prev_day_cache = load_prev_day_cache(prev_day)
     today_start = dt.datetime.combine(now_ist().date(), MARKET_OPEN)
 
-    atm = get_atm_strike(spot_price)
-    # Checking ATM+-100 and ATM+-400 (4 strikes x 2 option types = 8 calls
-    # per run). Angel One's documented getCandleData limit is 180/min, so
-    # 8 calls/5-min-tick is well within headroom -- the earlier rate-limit
-    # errors were Angel One-side flakiness (confirmed via their own forum),
-    # not something caused by call volume at this scale.
-    strikes_to_check = [atm - 400, atm - 100, atm + 100, atm + 400]
+    save_state(state)  # persist today's locked strikes immediately
 
     # ---- Manage existing open position first ----
     if state["open_position"] is not None:
