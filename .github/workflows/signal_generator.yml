@@ -1,5 +1,5 @@
 name: NIFTY Weekly Options - Signal Generator (Angel One data)
-# schedule re-sync trigger - 2026-06-24
+# schedule re-sync trigger - 2026-06-25
 on:
   schedule:
     - cron: "45,50,55 3 * * 1-5"        # 09:15,09:20,09:25 IST
