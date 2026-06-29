@@ -92,7 +92,7 @@ jobs:
         run: |
           git config user.name "signal-bot"
           git config user.email "actions@github.com"
-          git add state.json prev_day_candles.json 2>/dev/null || true
+          git add state.json prev_day_candles.json candle_history/ 2>/dev/null || true
 
           # Track whether this run actually created a commit, so we know
           # afterward whether a push failure is real or a harmless no-op.
