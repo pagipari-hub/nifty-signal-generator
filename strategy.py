@@ -469,6 +469,7 @@ def webhook_confirmed_ok(resp):
 
 
 def main():
+    print(f"[TRACE] main() started at {dt.datetime.now()}", flush=True)
     # FIX (1.2): guard first, before any login/network calls.
     if not is_market_open_now():
         print("Market closed (outside hours or holiday) -- skipping run.")
@@ -513,20 +514,27 @@ def main():
     today_start = dt.datetime.combine(now_ist().date(), MARKET_OPEN)
 
     save_state(state)  # persist today's locked strikes immediately
+    print(f"[TRACE] about to check open_position. state['open_position'] = {state['open_position']}", flush=True)
 
     # ---- Manage existing open position first ----
     if state["open_position"] is not None:
+        print("[TRACE] open_position is not None -- entering position-management branch", flush=True)
         pos = state["open_position"]
         token_info = ac.resolve_option_token(instruments, expiry, pos["strike"], pos["option_type"])
+        print(f"[TRACE] resolve_option_token returned: {token_info}", flush=True)
 
         if token_info:
+            print("[TRACE] token_info truthy -- fetching candles", flush=True)
             candles = get_candles_with_cache(smart_api, token_info["token"], prev_day, prev_day_cache, today_start)
+            print(f"[TRACE] got {len(candles)} candles", flush=True)
             df = compute_indicators(candles)
+            print(f"[TRACE] compute_indicators returned df with len={None if df is None else len(df)}", flush=True)
 
             if df is not None:
                 last = df.iloc[-1]
                 sl_hit = last["close"] > last["vwap"]
                 target_hit = last["close"] <= pos["target_price"]
+                print(f"[TRACE] last close={last['close']} vwap={last['vwap']} sl_hit={sl_hit} target_hit={target_hit}", flush=True)
 
                 if sl_hit or target_hit or is_eod_squareoff_time():
                     reason = "SL" if sl_hit else ("TARGET" if target_hit else "EOD")
