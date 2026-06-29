@@ -25,6 +25,10 @@ FIX LOG (production hardening pass):
   - send_to_webhook() now retries on failure (webhook is known to be choppy).
   - main() now gates state mutation on a confirmed-OK webhook response,
     instead of assuming the signal was acted on.
+  - Strike-locking now gated on STRIKE_LOCK_TIME (9:30 AM) instead of
+    "whichever run happens to be first" -- previously a 9:15-9:29 run
+    could lock strikes off an unsettled opening-range price. See
+    get_or_set_daily_strikes() for full reasoning.
 
 NOT YET DONE (deliberately deferred -- depends on the Shoonya/webhook side):
   - A webhook HTTP 200 here still only means "the webhook accepted the
@@ -100,6 +104,12 @@ NSE_HOLIDAYS_2026 = {
 MARKET_OPEN = dt.time(9, 15)
 MARKET_CLOSE = dt.time(15, 30)
 EOD_SQUAREOFF = dt.time(15, 20)
+
+# Strikes must be locked using the 9:30 AM spot price specifically, not
+# just "whatever the first run of the day happens to see" -- the market
+# opens at 9:15, so without this explicit gate a run at 9:15-9:29 would
+# lock strikes ~15 min too early, off a less-settled opening-range price.
+STRIKE_LOCK_TIME = dt.time(9, 30)
 
 
 PREV_DAY_CACHE_FILE = "prev_day_candles.json"
@@ -221,18 +231,26 @@ def save_state(state):
 def get_or_set_daily_strikes(state, smart_api):
     """
     The strategy's design intent is that today's strikes are anchored to
-    the SPOT PRICE AT THE FIRST RUN OF THE DAY (~9:15-9:30 AM), not
-    recalculated every 5 minutes. The strategy sells premium on whichever
-    side benefits from the day's move relative to that morning reference
-    point -- if spot rises from there, sell puts; if it falls, sell calls
-    -- so the strikes themselves must stay fixed all day for that logic to
+    the SPOT PRICE AT 9:30 AM SPECIFICALLY -- not just "whenever the first
+    run of the day happens to land." The strategy sells premium on
+    whichever side benefits from the day's move relative to that 9:30
+    reference point -- if spot rises from there, sell puts; if it falls,
+    sell calls -- so the strikes must stay fixed all day for that logic to
     mean what it's supposed to mean. Recalculating ATM every run would
-    chase a moving target and break this.
+    chase a moving target and break this; locking off a pre-9:30 run
+    (market opens 9:15) would anchor to a less-settled opening-range price
+    instead of the intended reference point.
+
+    FIX (strike-lock timing): previously this locked on the first run of
+    the day regardless of clock time, which meant a 9:15-9:29 run would
+    lock strikes ~15 min too early. Now gated on STRIKE_LOCK_TIME (9:30):
+    runs before 9:30 return (None, None, None) and do no locking at all;
+    the first run AT OR AFTER 9:30 does the lock.
 
     Snapshots ATM (and the 4 strikes derived from it) once, on the first
-    run of each trading day, and persists it in state.json so every later
-    run that day reuses the SAME strikes regardless of how much spot
-    drifts afterward. Returns (atm, strikes_to_check, spot_price_at_lock).
+    run of each trading day at/after 9:30, and persists it in state.json
+    so every later run that day reuses the SAME strikes regardless of how
+    much spot drifts afterward. Returns (atm, strikes_to_check, spot_price_at_lock).
 
     If today's snapshot already exists, returns it without calling
     fetch_spot_ltp again -- saves an API call on every run after the first.
@@ -244,6 +262,12 @@ def get_or_set_daily_strikes(state, smart_api):
 
     if state.get("daily_strikes_date") == today_str and state.get("daily_strikes"):
         return state["daily_atm"], state["daily_strikes"], None
+
+    if now_ist().time() < STRIKE_LOCK_TIME:
+        # Too early to lock yet -- this run still does heartbeat/housekeeping
+        # in main(), it just can't check for entry signals until strikes
+        # are locked at/after 9:30.
+        return None, None, None
 
     spot_price = ac.fetch_spot_ltp(smart_api)
     if spot_price is None:
@@ -460,13 +484,19 @@ def main():
     expiry = get_current_weekly_expiry()
 
     # FIX (strike-locking, per strategy design intent): strikes are
-    # anchored to spot price at the FIRST run of the day (~9:15-9:30 AM),
-    # not recalculated every 5 minutes -- the strategy's logic depends on
-    # the day's move being measured relative to that fixed morning
-    # reference point. See get_or_set_daily_strikes() for the full reason.
+    # anchored to spot price AT 9:30 AM SPECIFICALLY (see
+    # STRIKE_LOCK_TIME), not recalculated every 5 minutes -- the
+    # strategy's logic depends on the day's move being measured relative
+    # to that fixed 9:30 reference point. See get_or_set_daily_strikes()
+    # for the full reason.
     atm, strikes_to_check, spot_price_at_lock = get_or_set_daily_strikes(state, smart_api)
     if atm is None:
-        print("Could not fetch spot price to lock today's strikes, aborting this run.", file=sys.stderr)
+        if now_ist().time() < STRIKE_LOCK_TIME:
+            # Not an error -- just too early to lock strikes yet. Heartbeat
+            # already ran above; nothing else to do this run.
+            print(f"Before {STRIKE_LOCK_TIME.strftime('%H:%M')} strike-lock time -- skipping signal check this run.")
+        else:
+            print("Could not fetch spot price to lock today's strikes, aborting this run.", file=sys.stderr)
         return
     if spot_price_at_lock is not None:
         print(f"Locked today's strikes: ATM={atm} (spot={spot_price_at_lock}) -> {strikes_to_check}")
