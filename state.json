@@ -1,15 +1,6 @@
 {
-  "open_position": {
-    "symbol": "NIFTY30JUN2623700PE",
-    "token": "79708",
-    "strike": 23700,
-    "option_type": "PE",
-    "entry_price": 7.79,
-    "qty": 75,
-    "target_price": 7.37,
-    "entry_time": "2026-06-29T10:39:05.834347+05:30"
-  },
-  "last_run": "2026-06-29T11:09:08.256449+05:30",
+  "open_position": null,
+  "last_run": "2026-06-29T13:00:07.937422+05:30",
   "heartbeat_date": "2026-06-29",
   "daily_strikes_date": "2026-06-29",
   "daily_atm": 24100,
