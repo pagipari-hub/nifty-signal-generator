@@ -1,15 +1,6 @@
 {
-  "open_position": {
-    "symbol": "NIFTY30JUN2624000CE",
-    "token": "71472",
-    "strike": 24000,
-    "option_type": "CE",
-    "entry_price": 26.85,
-    "qty": 75,
-    "target_price": 16.950000000000003,
-    "entry_time": "2026-06-30T12:46:01.800103+05:30"
-  },
-  "last_run": "2026-06-30T13:05:35.619236+05:30",
+  "open_position": null,
+  "last_run": "2026-06-30T13:08:47.668337+05:30",
   "heartbeat_date": "2026-06-30",
   "daily_strikes_date": "2026-06-30",
   "daily_atm": 23900,
