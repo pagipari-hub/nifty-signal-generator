@@ -1,6 +1,15 @@
 {
-  "open_position": null,
-  "last_run": "2026-06-30T11:40:44.625457+05:30",
+  "open_position": {
+    "symbol": "NIFTY30JUN2624000PE",
+    "token": "71473",
+    "strike": 24000,
+    "option_type": "PE",
+    "entry_price": 85.32,
+    "qty": 75,
+    "target_price": 74.15999999999997,
+    "entry_time": "2026-06-30T11:46:14.434688+05:30"
+  },
+  "last_run": "2026-06-30T11:46:15.436391+05:30",
   "heartbeat_date": "2026-06-30",
   "daily_strikes_date": "2026-06-30",
   "daily_atm": 23900,
