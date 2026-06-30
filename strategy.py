@@ -3,84 +3,41 @@ NIFTY weekly options strategy runner -- DATA + SIGNAL GENERATION ONLY.
 
 Runs on GitHub Actions every 5 min during market hours.
 1. Logs into Angel One (data APIs only, no static IP needed)
-2. Resolves ATM strikes (short legs at ATM+-100, hedge legs at ATM+-400)
-   via the official instrument master JSON (never guesses the symbol format)
+2. Resolves ATM +-2 CE/PE strikes via the official instrument master JSON
+   (never guesses the symbol format)
 3. Fetches 5-min candles, computes EMA5/EMA25/VWAP
-4. Watches for a true EMA5-crosses-down-VWAP signal on a SHORT strike,
-   waits for a limit fill (see ENTRY LOGIC below), and on fill sends BOTH
-   legs of the credit spread (short SELL + hedge BUY) to the webhook in one
-   payload
+4. Checks entry signal; if found, computes entry/SL/target
 5. POSTs the signal to the webhook (which holds the Shoonya session and
    either simulates a paper fill or places a real order, depending on its
    own LIVE_MODE flag -- that decision lives in the webhook, not here)
-6. Persists minimal state (pending signal awaiting fill, and current open
-   position, for managing SL/target) to state.json, committed back to the
-   repo by the GitHub Action.
+6. Persists minimal state (current open position, for managing SL/target)
+   to state.json, committed back to the repo by the GitHub Action.
 
 This script must NEVER place a real order itself.
 
 ---
-STRATEGY SPEC (current, agreed 2026-06-30 -- supersedes all earlier docstrings):
+FIX LOG (production hardening pass):
+  - All datetime.now() calls now use IST explicitly (the GH Actions job sets
+    TZ=Asia/Kolkata, but we don't rely on that alone -- this script is
+    correct even if run somewhere that doesn't set TZ).
+  - Added an internal market-hours + holiday guard, run before any API calls.
+  - get_current_weekly_expiry() now adjusts backward off NSE holidays.
+  - send_to_webhook() now retries on failure (webhook is known to be choppy).
+  - main() now gates state mutation on a confirmed-OK webhook response,
+    instead of assuming the signal was acted on.
+  - Strike-locking now gated on STRIKE_LOCK_TIME (9:30 AM) instead of
+    "whichever run happens to be first" -- previously a 9:15-9:29 run
+    could lock strikes off an unsettled opening-range price. See
+    get_or_set_daily_strikes() for full reasoning.
 
-  STRIKES: short leg at ATM+-100 (premium collection), hedge leg at the
-  SAME side's ATM+-400 (300 points further out, BUY, defined-risk hedge).
-  This is a credit spread, NOT a directional "sell whichever side benefits"
-  strategy -- EMA5/VWAP/EMA25 signal is checked independently per strike,
-  with no directional bias. (An earlier docstring here incorrectly
-  described a directional approach; that was never the actual logic and
-  has been removed.)
-
-  ENTRY:
-    - Trigger on candle N: TRUE crossover -- EMA5 was >= VWAP on candle
-      N-1, and is < VWAP on candle N -- AND EMA25 > EMA5 and EMA25 > VWAP
-      on candle N. (State alone, e.g. "EMA5 < VWAP right now", is NOT a
-      trigger -- it must be a fresh cross. This intentionally does not yet
-      cover the "fires every candle while condition holds" re-entry bug
-      for an already-open position; that's a separate, deliberately
-      deferred item -- see NOT YET DONE below.)
-    - Reference price for the limit: candle N+1's EMA5 estimated AT ITS
-      OPEN, not at its close. Since EMA is only well-defined on closed
-      candles, this is computed by rolling candle N's EMA5 forward one
-      step using candle N+1's OPEN price in place of a close (see
-      roll_ema5_forward()). This deliberately avoids using candle N's own
-      (already-known, more lagging) EMA5, and avoids waiting for candle
-      N+1 to fully close, both of which were observed in practice to set
-      a limit price that a fast move would never retrace to.
-    - limit_entry_price = that estimated EMA5 * 0.95. Computed ONCE
-      (at candle N+1's open) and held fixed -- never recalculated.
-    - The limit is monitored for fill over candles N+1 through N+5
-      inclusive (5 candles, starting with the same candle whose open
-      produced the price). If candle's high >= limit_entry_price during
-      that window, the SELL fills at limit_entry_price. If the window
-      elapses with no fill, the signal is cancelled -- no trade.
-    - On fill, the hedge leg (same side, 300 points further OTM) is
-      bought at MARKET (current LTP) -- no limit/precision needed for the
-      hedge, confirmed acceptable by design.
-
-  STOP-LOSS (computed once at fill, using the TRIGGER candle N -- not the
-  fill candle):
-    normal_sl_price = max(candle_N.high, vwap_at_candle_N)
-    normal_sl_pct   = (normal_sl_price - entry_price) / entry_price
-    sl_pct_final    = max(normal_sl_pct, 0.10)      # 10% floor, not a cap
-    SL_price        = entry_price * (1 + sl_pct_final)
-
-  TARGET: fixed 1:2 risk-reward (risk = SL_price - entry_price).
-    target_price = entry_price - 2 * risk
-    Trailing logic is intentionally deferred -- fixed target only for now.
-
-NOT YET DONE (deliberately deferred):
-  - True crossover detection above applies to NEW entries only. The
-    existing re-entry/management path for an OPEN position still checks
-    state, not transitions -- Pragnesh's explicit call is to keep
-    collecting paper-trading case studies before touching that logic.
-  - SL widening to VWAP+buffer / India VIX chop filter -- explicitly
-    deferred pending more case studies.
-  - Trailing target (only "1:2 fixed, revisit later" implemented).
+NOT YET DONE (deliberately deferred -- depends on the Shoonya/webhook side):
   - A webhook HTTP 200 here still only means "the webhook accepted the
-    request," NOT "Shoonya filled the order." Real fill confirmation has
-    to happen inside the webhook (it holds the Shoonya session).
+    request," NOT "Shoonya filled the order." Real fill confirmation has to
+    happen inside the webhook (it holds the Shoonya session), and until
+    that's built, the gating below is necessary-but-not-sufficient. Treat
+    state.json as "probably right" rather than "guaranteed right" until
+    that follow-up lands.
   - Startup-time reconciliation against actual broker positions.
-  - Holiday-shift edge case for Tuesday expiry not yet handled.
 """
 
 import json
@@ -106,26 +63,11 @@ STATE_FILE = "state.json"
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL")  # set as a GitHub Secret
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SHARED_SECRET")  # simple auth between GH Action and webhook
 
-# Lot sizing -- LOT_SIZE is the exchange-defined unit size (verify
-# periodically -- NSE revises this; confirmed 65 as of 2026-06-30, see
-# NSE circular FAOP70616 / effective Jan 2026 revision). NUM_LOTS is how
-# many lots we actually trade -- change ONLY this to scale position size
-# up or down (1, 2, 3...).
-LOT_SIZE = 65
-NUM_LOTS = 1
-QTY = LOT_SIZE * NUM_LOTS
-
-ENTRY_WINDOW_CANDLES = 5          # candles N+1..N+5 to wait for a limit fill
-ENTRY_LIMIT_DISCOUNT = 0.05       # limit price = ref EMA5 * (1 - this)
-SL_FLOOR_PCT = 0.10                # minimum SL distance as % of entry price
-HEDGE_OFFSET = 300                 # points between short strike and hedge strike
+LOT_SIZE = 75  # NIFTY lot size -- confirm current value before going live;
+                # NSE revises this periodically.
 
 WEBHOOK_RETRY_ATTEMPTS = 3
-# FIX (rate-limit backoff): previously a flat 3s delay between every retry.
-# Now exponential -- 2s, then 5s, then 10s -- so repeated failures (e.g. a
-# sustained webhook outage) back off instead of hammering at a fixed
-# interval.
-WEBHOOK_RETRY_DELAYS_SECONDS = [2, 5, 10]
+WEBHOOK_RETRY_DELAY_SECONDS = 2
 
 # Static list of NSE trading holidays. Update yearly -- there is no reliable
 # free API for this, so this has to be maintained by hand against NSE's
@@ -171,6 +113,79 @@ STRIKE_LOCK_TIME = dt.time(9, 30)
 
 
 PREV_DAY_CACHE_FILE = "prev_day_candles.json"
+
+# Backtest data collection: every candle we already fetch for live signal
+# generation also gets appended to a per-day CSV under this folder. This is
+# NOT a separate fetch -- it's the same data the strategy already pulled,
+# just persisted so it accumulates into a usable backtest dataset over time.
+# Deliberately scoped to only the strikes we actually watch each day (no
+# extra API calls, no extra cost) -- see chat notes for why a full historical
+# backtest is a separate, bigger task than this.
+CANDLE_HISTORY_DIR = "candle_history"
+CANDLE_HISTORY_COLUMNS = [
+    "date", "time", "symbol", "strike", "option_type",
+    "open", "high", "low", "close", "volume",
+    "ema5", "ema25", "vwap", "signal_fired",
+]
+
+
+def append_to_candle_history(df, symbol, strike, option_type, signal_fired_mask=None):
+    """
+    Appends today's processed candles (with EMA5/EMA25/VWAP already computed
+    by compute_indicators()) to candle_history/<today>.csv, one row per
+    candle per contract. Safe to call multiple times per run/day for the
+    same contract -- de-duplicates on (time, symbol) so re-running the same
+    5-min window twice (e.g. two runs both seeing the 10:15 candle before
+    it's finalized) doesn't create duplicate rows.
+
+    signal_fired_mask: optional boolean Series aligned to df, marking which
+    rows had check_entry_signal() return True. If not given, signal_fired is
+    left blank for all rows (caller didn't have it handy) rather than
+    guessed -- guessing here would silently corrupt the backtest dataset.
+    """
+    if df is None or df.empty:
+        return
+
+    os.makedirs(CANDLE_HISTORY_DIR, exist_ok=True)
+    today_str = now_ist().date().isoformat()
+    path = os.path.join(CANDLE_HISTORY_DIR, f"{today_str}.csv")
+
+    out = pd.DataFrame({
+        "date": df["time"].dt.date.astype(str),
+        "time": df["time"].astype(str),
+        "symbol": symbol,
+        "strike": strike,
+        "option_type": option_type,
+        "open": df["open"],
+        "high": df["high"],
+        "low": df["low"],
+        "close": df["close"],
+        "volume": df["volume"],
+        "ema5": df["ema5"],
+        "ema25": df["ema25"],
+        "vwap": df["vwap"],
+        "signal_fired": signal_fired_mask if signal_fired_mask is not None else pd.NA,
+    })[CANDLE_HISTORY_COLUMNS]
+
+    if os.path.exists(path):
+        existing = pd.read_csv(path)
+        combined = pd.concat([existing, out], ignore_index=True)
+        # De-dupe on (time, symbol). signal_fired needs special handling:
+        # most rows in `out` carry NA for signal_fired (we only know the
+        # true/false value for the LAST row of whichever df the caller had
+        # this run -- earlier rows were already correctly recorded on a
+        # prior run). A naive keep="last" would let that NA overwrite a
+        # previously-recorded True/False. Instead: sort so real values
+        # (non-NA) sort before NA for the same (time, symbol), then keep
+        # the first -- i.e. prefer a known value over a blank one.
+        combined["_signal_is_na"] = combined["signal_fired"].isna()
+        combined = combined.sort_values(["symbol", "time", "_signal_is_na"])
+        combined = combined.drop_duplicates(subset=["time", "symbol"], keep="first")
+        combined = combined.drop(columns=["_signal_is_na"])
+        combined = combined.sort_values(["symbol", "time"]).reset_index(drop=True)
+        combined.to_csv(path, index=False)
+    else:
+        out.to_csv(path, index=False)
 
 
 def load_prev_day_cache(expected_date):
@@ -253,6 +268,13 @@ def previous_trading_day(date):
 
 
 def is_market_open_now():
+    """
+    FIX (1.2): nothing previously stopped this script from running outside
+    market hours or on a holiday -- the cron schedule restricts *automatic*
+    triggers, but workflow_dispatch (manual runs) and holiday non-awareness
+    were both unguarded. This is checked first in main(), before any
+    API/network calls are made.
+    """
     n = now_ist()
     if not is_trading_day(n.date()):
         return False
@@ -265,7 +287,6 @@ def load_state():
             return json.load(f)
     return {
         "open_position": None,
-        "pending_signal": None,
         "last_run": None,
         "heartbeat_date": None,
         "daily_strikes_date": None,
@@ -282,20 +303,27 @@ def save_state(state):
 
 def get_or_set_daily_strikes(state, smart_api):
     """
-    Strikes are anchored to the SPOT PRICE AT 9:30 AM SPECIFICALLY -- not
-    just "whenever the first run of the day happens to land." Recalculating
-    ATM every run would chase a moving target; locking off a pre-9:30 run
+    The strategy's design intent is that today's strikes are anchored to
+    the SPOT PRICE AT 9:30 AM SPECIFICALLY -- not just "whenever the first
+    run of the day happens to land." The strategy sells premium on
+    whichever side benefits from the day's move relative to that 9:30
+    reference point -- if spot rises from there, sell puts; if it falls,
+    sell calls -- so the strikes must stay fixed all day for that logic to
+    mean what it's supposed to mean. Recalculating ATM every run would
+    chase a moving target and break this; locking off a pre-9:30 run
     (market opens 9:15) would anchor to a less-settled opening-range price
     instead of the intended reference point.
 
-    Snapshots ATM (and the 4 strikes derived from it -- ATM-400, ATM-100,
-    ATM+100, ATM+400) once, on the first run of each trading day at/after
-    9:30, and persists it in state.json so every later run that day reuses
-    the SAME strikes regardless of how much spot drifts afterward.
-    ATM+-100 are the SHORT (signal-checked, premium-selling) strikes;
-    ATM+-400 are the HEDGE strikes (bought opposite the short, same side,
-    on fill -- see find_hedge_strike()). Returns
-    (atm, strikes_to_check, spot_price_at_lock).
+    FIX (strike-lock timing): previously this locked on the first run of
+    the day regardless of clock time, which meant a 9:15-9:29 run would
+    lock strikes ~15 min too early. Now gated on STRIKE_LOCK_TIME (9:30):
+    runs before 9:30 return (None, None, None) and do no locking at all;
+    the first run AT OR AFTER 9:30 does the lock.
+
+    Snapshots ATM (and the 4 strikes derived from it) once, on the first
+    run of each trading day at/after 9:30, and persists it in state.json
+    so every later run that day reuses the SAME strikes regardless of how
+    much spot drifts afterward. Returns (atm, strikes_to_check, spot_price_at_lock).
 
     If today's snapshot already exists, returns it without calling
     fetch_spot_ltp again -- saves an API call on every run after the first.
@@ -328,30 +356,24 @@ def get_or_set_daily_strikes(state, smart_api):
     return atm, strikes, spot_price
 
 
-def find_hedge_strike(short_strike, atm):
-    """
-    Maps a SHORT strike (ATM-100 or ATM+100) to its HEDGE strike (300
-    points further out, same side): ATM-100 -> ATM-400, ATM+100 -> ATM+400.
-    Returns None if short_strike isn't one of the two recognized short
-    strikes (defensive -- should never happen given how strikes_to_check
-    is built).
-    """
-    if short_strike == atm - 100:
-        return atm - 400
-    if short_strike == atm + 100:
-        return atm + 400
-    return None
-
-
-def is_short_strike(strike, atm):
-    return strike in (atm - 100, atm + 100)
-
-
 def send_heartbeat_if_needed(state):
     """
     Sends a one-line 'I'm alive' heartbeat through the webhook (which relays
     it to Telegram) once per trading day, on whichever run is the first one
     to successfully reach this point that day.
+
+    Why this matters: GitHub Actions scheduled workflows can silently fail
+    to fire at all (known platform-side flakiness, not specific to this
+    repo -- see e.g. github.com/orgs/community/discussions/185024). When
+    that happens, there's no error and no log -- the job just never starts.
+    A missing heartbeat by ~9:20 AM is the signal to check the Actions tab
+    and, if needed, push a trivial commit to .github/workflows/ to force
+    GitHub to resync the schedule.
+
+    This does NOT detect every failure mode (e.g. it can't warn you if the
+    very first run of the day is the one that fails to fire), but it does
+    catch the much more common case of "the schedule silently stopped
+    firing entirely partway through the morning."
     """
     today_str = now_ist().date().isoformat()
     if state.get("heartbeat_date") == today_str:
@@ -368,10 +390,15 @@ def send_heartbeat_if_needed(state):
 def get_current_weekly_expiry():
     """
     Returns the current weekly NIFTY expiry date, adjusted for holidays.
+
     NSE shifted NIFTY's weekly expiry from Thursday to TUESDAY, effective
-    September 1, 2025. If a computed Tuesday is a market holiday, NSE
-    shifts the expiry to the previous trading day -- walk backward until a
-    real trading day is found.
+    September 1, 2025 (SEBI directive to spread weekly expiry volume across
+    the week). If NSE changes it again, update the weekday number below
+    (1 = Tuesday).
+
+    FIX (1.3): if the computed Tuesday is a market holiday, NSE shifts the
+    expiry to the previous trading day. This now walks backward from the
+    computed date until it lands on an actual trading day.
     """
     today = now_ist().date()
     days_ahead = (1 - today.weekday()) % 7  # 1 = Tuesday
@@ -389,15 +416,19 @@ def get_atm_strike(spot_price, step=50):
 
 def compute_indicators(candles):
     """
-    EMA5/EMA25 computed across the FULL fetched range (today + previous
-    trading day) so they're warmed up by today's market open, instead of
-    restarting cold every morning. VWAP is computed only on today's rows
-    and resets at today's market open (correct VWAP definition).
+    FIX (2.3, extended): VWAP must reset at today's market open -- that part
+    was already fixed and is unchanged below. But EMA5/EMA25 should NOT
+    reset daily; restarting them cold every morning means the first ~2+
+    hours of every session have an EMA25 that's still mostly seed-value,
+    not a real 25-period average, so the strategy was effectively blind to
+    entry signals until ~11:30 AM most days.
 
-    Returns the full warmed-up DataFrame (today's rows only, but with EMA
-    columns that reflect the full history) plus separately exposes
-    ema5_alpha so callers can roll EMA5 forward by one step without
-    re-running the whole pandas computation (see roll_ema5_forward()).
+    Fix: EMA5/EMA25 are computed across the FULL fetched range (today +
+    previous trading day, see previous_trading_day() and how main() calls
+    fetch_5min_candles), so they're already warmed up by today's market
+    open. VWAP is still computed only on today's rows. The returned
+    DataFrame contains only today's rows, with EMA values carried forward
+    correctly and VWAP correctly session-anchored.
     """
     df = pd.DataFrame(candles)
     if df.empty:
@@ -408,15 +439,21 @@ def compute_indicators(candles):
 
     today = now_ist().date()
 
+    # EMA needs the full range (includes previous trading day) to be
+    # properly warmed up by the time today's session starts.
     df["ema5"] = df["close"].ewm(span=5, adjust=False).mean()
     df["ema25"] = df["close"].ewm(span=25, adjust=False).mean()
 
+    # VWAP must only accumulate from today's market open -- zero out
+    # contribution from any prior-day rows before the cumulative sum.
     today_mask = df["time"].dt.date == today
     typical_price = (df["high"] + df["low"] + df["close"]) / 3
     cum_vol = df["volume"].where(today_mask, 0).cumsum()
     cum_tp_vol = (typical_price * df["volume"]).where(today_mask, 0).cumsum()
     df["vwap"] = cum_tp_vol / cum_vol.replace(0, pd.NA)
 
+    # Only today's rows are relevant for signal-checking from here on --
+    # previous-day rows were only needed to warm up EMA.
     df = df[today_mask].reset_index(drop=True)
 
     if len(df) < 2:
@@ -427,66 +464,21 @@ def compute_indicators(candles):
     return df
 
 
-def roll_ema5_forward(prev_ema5, new_price, span=5):
-    """
-    Rolls a closed-candle EMA5 value forward by exactly one step using
-    `new_price` in place of that next candle's close -- this is how we
-    estimate "EMA5 at the OPEN of the next candle" without waiting for
-    that candle to actually close.
-
-    Standard EWM step: new_ema = price * alpha + prev_ema * (1 - alpha),
-    alpha = 2 / (span + 1). This is the same recursive formula pandas'
-    .ewm(span=..., adjust=False) uses internally, applied manually for one
-    extra step with an open price instead of a close price.
-
-    Rationale (see STRATEGY SPEC above): using the trigger candle's own
-    EMA5 (more lagging) as the entry reference was found in practice to
-    set limit prices that fast/large moves never retraced to, leaving
-    entries permanently unfilled while the underlying option decayed to
-    near zero. Rolling forward with the next candle's open reacts to the
-    move immediately instead of lagging it.
-    """
-    alpha = 2.0 / (span + 1)
-    return new_price * alpha + prev_ema5 * (1 - alpha)
-
-
-def check_crossover_trigger(df):
-    """
-    TRUE crossover only -- NOT just "EMA5 is currently below VWAP" (that
-    was the old, buggy state-based check, which can be satisfied for many
-    consecutive candles after the actual cross and re-fire continuously).
-    Requires at least 2 of today's rows so a previous candle exists to
-    compare against.
-
-    Returns the trigger candle (as a dict) if candle N is a fresh
-    downward cross with EMA25 confirmation, else None.
-    """
+def check_entry_signal(df):
     if df is None or len(df) < 2:
-        return None
-
-    prev = df.iloc[-2]
-    curr = df.iloc[-1]
-
-    crossed_down = (prev["ema5"] >= prev["vwap"]) and (curr["ema5"] < curr["vwap"])
-    ema25_confirms = (curr["ema25"] > curr["ema5"]) and (curr["ema25"] > curr["vwap"])
-
-    if crossed_down and ema25_confirms:
-        return curr.to_dict()
-    return None
+        return False
+    last = df.iloc[-1]
+    return (
+        last["ema5"] < last["vwap"]
+        and last["ema25"] > last["ema5"]
+        and last["ema25"] > last["vwap"]
+    )
 
 
-def compute_sl_price(entry_price, trigger_high, trigger_vwap):
-    """
-    SL = max(trigger candle's high, VWAP at trigger), expressed as a %
-    distance from entry, with a 10% FLOOR (not a cap) -- if the normal
-    distance is already >= 10%, it's used as-is; if it's tighter than 10%,
-    10% is used instead. E.g. entry 89 -> SL >= 97.9 (~98); entry 67 ->
-    SL >= 73.7 (~74).
-    """
-    normal_sl_price = max(trigger_high, trigger_vwap)
-    normal_sl_pct = (normal_sl_price - entry_price) / entry_price
-    sl_pct_final = max(normal_sl_pct, SL_FLOOR_PCT)
-    return entry_price * (1 + sl_pct_final)
+def compute_entry_price(trigger_candle):
+    low = trigger_candle["low"]
+    high = trigger_candle["high"]
+    return low + 0.40 * (high - low)
 
 
 def is_eod_squareoff_time():
@@ -495,10 +487,10 @@ def is_eod_squareoff_time():
 
 def send_to_webhook(payload):
     """
-    Retries with EXPONENTIAL backoff (2s, 5s, 10s) instead of a flat delay
-    -- a sustained webhook outage backs off instead of hammering at a fixed
-    interval. Still returns None on total failure; callers MUST check for
-    that.
+    FIX (1.5): the webhook is known to be choppy (Shoonya-side flakiness
+    surfaces here). Previously this was a single attempt with no retry --
+    now retries with a short delay before giving up. Still returns None on
+    total failure; callers MUST check for that (see FIX 1.4 in main()).
     """
     if not WEBHOOK_URL:
         print("WEBHOOK_URL not set -- skipping webhook call. Payload was:", payload)
@@ -519,8 +511,7 @@ def send_to_webhook(payload):
             print(f"Webhook call failed (attempt {attempt}/{WEBHOOK_RETRY_ATTEMPTS}): {e}",
                   file=sys.stderr)
             if attempt < WEBHOOK_RETRY_ATTEMPTS:
-                delay = WEBHOOK_RETRY_DELAYS_SECONDS[min(attempt - 1, len(WEBHOOK_RETRY_DELAYS_SECONDS) - 1)]
-                time.sleep(delay)
+                time.sleep(WEBHOOK_RETRY_DELAY_SECONDS)
 
     print(f"Webhook call failed after {WEBHOOK_RETRY_ATTEMPTS} attempts: {last_err}",
           file=sys.stderr)
@@ -529,9 +520,17 @@ def send_to_webhook(payload):
 
 def webhook_confirmed_ok(resp):
     """
-    A 200 here means "the webhook received and processed the request," not
-    "Shoonya filled the order." True fill-confirmation has to be built on
-    the webhook side (it holds the Shoonya session).
+    FIX (1.4): previously the return value of send_to_webhook() was never
+    checked at all -- state was mutated unconditionally after firing the
+    request. This at least confirms the webhook accepted the request.
+
+    CAVEAT (documented, not yet resolved): a 200 here means "the webhook
+    received and processed the request," not "Shoonya filled the order."
+    The webhook currently returns 200 as soon as place_order() returns an
+    order ID, before any fill confirmation. True fill-confirmation has to
+    be built on the webhook side (it holds the Shoonya session) and this
+    function's meaning gets stronger once that lands -- it isn't weakened
+    by adding this check now, but don't treat this as the final word yet.
     """
     if resp is None:
         return False
@@ -542,173 +541,103 @@ def webhook_confirmed_ok(resp):
     return resp.status_code == 200 and body.get("status") == "ok"
 
 
-def manage_open_position(state, smart_api, instruments, expiry, prev_day, prev_day_cache, today_start):
-    """
-    Checks the open position's SHORT leg for SL/target/EOD exit. Exit
-    decisions are based on the short leg only (the hedge leg's job is risk
-    containment, not signal generation). On confirmed exit, sends an EXIT
-    for both legs so the webhook can square off the whole spread.
-    """
-    pos = state["open_position"]
-    short = pos["short_leg"]
-    token_info = ac.resolve_option_token(instruments, expiry, short["strike"], short["option_type"])
+def main():
+    # FIX (1.2): guard first, before any login/network calls.
+    if not is_market_open_now():
+        print("Market closed (outside hours or holiday) -- skipping run.")
+        return
 
-    if not token_info:
+    state = load_state()
+    send_heartbeat_if_needed(state)
+    save_state(state)  # persist heartbeat_date immediately, don't wait for end of run
+
+    smart_api = ac.login()
+    instruments = ac.download_instrument_master()
+
+    expiry = get_current_weekly_expiry()
+
+    # FIX (strike-locking, per strategy design intent): strikes are
+    # anchored to spot price AT 9:30 AM SPECIFICALLY (see
+    # STRIKE_LOCK_TIME), not recalculated every 5 minutes -- the
+    # strategy's logic depends on the day's move being measured relative
+    # to that fixed 9:30 reference point. See get_or_set_daily_strikes()
+    # for the full reason.
+    atm, strikes_to_check, spot_price_at_lock = get_or_set_daily_strikes(state, smart_api)
+    if atm is None:
+        if now_ist().time() < STRIKE_LOCK_TIME:
+            # Not an error -- just too early to lock strikes yet. Heartbeat
+            # already ran above; nothing else to do this run.
+            print(f"Before {STRIKE_LOCK_TIME.strftime('%H:%M')} strike-lock time -- skipping signal check this run.")
+        else:
+            print("Could not fetch spot price to lock today's strikes, aborting this run.", file=sys.stderr)
+        return
+    if spot_price_at_lock is not None:
+        print(f"Locked today's strikes: ATM={atm} (spot={spot_price_at_lock}) -> {strikes_to_check}")
+
+    # FIX (rate-limit regression): previously we asked Angel One for the
+    # full previous-day + today range on EVERY call (8 calls/run), which
+    # made each call heavier and triggered repeated rate-limit failures
+    # that exhausted all retries. Now: previous day's candles are fetched
+    # ONCE per day (cached to disk, see load_prev_day_cache), and each run
+    # only fetches today's (small, cheap) candles fresh, then merges with
+    # the cached previous-day data in memory for EMA warm-up.
+    prev_day = previous_trading_day(now_ist().date())
+    prev_day_cache = load_prev_day_cache(prev_day)
+    today_start = dt.datetime.combine(now_ist().date(), MARKET_OPEN)
+
+    save_state(state)  # persist today's locked strikes immediately
+
+    # ---- Manage existing open position first ----
+    if state["open_position"] is not None:
+        pos = state["open_position"]
+        token_info = ac.resolve_option_token(instruments, expiry, pos["strike"], pos["option_type"])
+
+        if token_info:
+            candles = get_candles_with_cache(smart_api, token_info["token"], prev_day, prev_day_cache, today_start)
+            df = compute_indicators(candles)
+
+            # Backtest data collection -- same df we're already using for
+            # SL/target checks, just persisted. signal_fired left blank here
+            # since this is the position-MANAGEMENT branch (we already have
+            # a position open on this contract; check_entry_signal() isn't
+            # being evaluated for it this run).
+            append_to_candle_history(df, pos["symbol"], pos["strike"], pos["option_type"])
+
+            if df is not None:
+                last = df.iloc[-1]
+                sl_hit = last["close"] > last["vwap"]
+                target_hit = last["close"] <= pos["target_price"]
+
+                if sl_hit or target_hit or is_eod_squareoff_time():
+                    reason = "SL" if sl_hit else ("TARGET" if target_hit else "EOD")
+                    resp = send_to_webhook({
+                        "action": "EXIT",
+                        "reason": reason,
+                        "symbol": pos["symbol"],
+                        "qty": pos["qty"],
+                        "price": float(last["close"]),
+                        "time": now_ist().isoformat(),
+                    })
+
+                    # FIX (1.4): only clear the position if the webhook
+                    # confirmed it processed the exit. If it failed, leave
+                    # state untouched -- next run will retry the exit check
+                    # rather than silently believing we're flat.
+                    if webhook_confirmed_ok(resp):
+                        state["open_position"] = None
+                    else:
+                        print(
+                            "EXIT webhook not confirmed -- leaving open_position "
+                            "in state.json so the next run retries.",
+                            file=sys.stderr,
+                        )
+
         save_state(state)
         save_prev_day_cache(prev_day, prev_day_cache)
         return
 
-    candles = get_candles_with_cache(smart_api, token_info["token"], prev_day, prev_day_cache, today_start)
-    df = compute_indicators(candles)
-
-    if df is not None:
-        last = df.iloc[-1]
-        sl_hit = last["close"] > pos["sl_price"]
-        target_hit = last["close"] <= pos["target_price"]
-
-        if sl_hit or target_hit or is_eod_squareoff_time():
-            reason = "SL" if sl_hit else ("TARGET" if target_hit else "EOD")
-            resp = send_to_webhook({
-                "action": "EXIT",
-                "reason": reason,
-                "short_leg": {"symbol": short["symbol"], "qty": short["qty"], "price": float(last["close"])},
-                "hedge_leg": {"symbol": pos["hedge_leg"]["symbol"], "qty": pos["hedge_leg"]["qty"]},
-                "time": now_ist().isoformat(),
-            })
-
-            if webhook_confirmed_ok(resp):
-                state["open_position"] = None
-            else:
-                print(
-                    "EXIT webhook not confirmed -- leaving open_position "
-                    "in state.json so the next run retries.",
-                    file=sys.stderr,
-                )
-
-    save_state(state)
-    save_prev_day_cache(prev_day, prev_day_cache)
-
-
-def manage_pending_signal(state, smart_api, instruments, expiry, atm, prev_day, prev_day_cache, today_start):
-    """
-    Advances a pending signal (awaiting limit fill) by exactly one step
-    per run:
-      1. If we're still waiting on candle N+1's open to compute the limit
-         price, compute it now from this run's latest candle (treated as
-         candle N+1) and start the fill-monitoring window on this same
-         candle.
-      2. Otherwise, check this run's latest candle against the
-         already-fixed limit price.
-      3. On fill: compute SL/target, buy the hedge leg at market, send the
-         combined ENTRY payload, and (on confirmation) set open_position.
-      4. If the window (5 candles) elapses with no fill, cancel the
-         pending signal -- no trade.
-    Returns True if it consumed this run (so main() should not also scan
-    for new signals this run), False otherwise.
-    """
-    pending = state["pending_signal"]
-    strike = pending["strike"]
-    option_type = pending["option_type"]
-
-    token_info = ac.resolve_option_token(instruments, expiry, strike, option_type)
-    if not token_info:
-        return True  # can't proceed this run, but don't abandon the pending signal
-
-    candles = get_candles_with_cache(smart_api, token_info["token"], prev_day, prev_day_cache, today_start)
-    df = compute_indicators(candles)
-    if df is None or len(df) < 1:
-        return True
-
-    latest = df.iloc[-1]
-
-    if pending["limit_entry_price"] is None:
-        # This run's latest candle is candle N+1 -- compute the limit
-        # price from its OPEN, rolling the trigger candle's EMA5 forward.
-        rolled_ema5 = roll_ema5_forward(pending["trigger_ema5"], latest["open"])
-        limit_entry_price = rolled_ema5 * (1 - ENTRY_LIMIT_DISCOUNT)
-        pending["limit_entry_price"] = limit_entry_price
-        pending["candles_elapsed"] = 0
-        print(f"Pending signal {strike}{option_type}: limit price set to {limit_entry_price:.2f} "
-              f"(rolled EMA5 {rolled_ema5:.2f} from open {latest['open']:.2f})")
-
-    pending["candles_elapsed"] += 1
-    limit_entry_price = pending["limit_entry_price"]
-
-    filled = latest["high"] >= limit_entry_price
-
-    if filled:
-        entry_price = limit_entry_price
-        sl_price = compute_sl_price(entry_price, pending["trigger_high"], pending["trigger_vwap"])
-        risk = sl_price - entry_price
-        target_price = entry_price - 2 * risk
-
-        hedge_strike = find_hedge_strike(strike, atm)
-        hedge_token_info = ac.resolve_option_token(instruments, expiry, hedge_strike, option_type)
-
-        short_leg = {
-            "symbol": token_info["symbol"], "token": token_info["token"],
-            "strike": strike, "option_type": option_type,
-            "side": "SELL", "price": entry_price, "qty": QTY,
-        }
-        # Hedge is bought at MARKET, not a limit -- no price needed/sent
-        # here; the webhook (which holds the Shoonya session) places it as
-        # a market order using symbol/token alone.
-        hedge_leg = {
-            "symbol": hedge_token_info["symbol"] if hedge_token_info else None,
-            "token": hedge_token_info["token"] if hedge_token_info else None,
-            "strike": hedge_strike, "option_type": option_type,
-            "side": "BUY", "qty": QTY,
-        }
-
-        resp = send_to_webhook({
-            "action": "ENTRY",
-            "short_leg": short_leg,
-            "hedge_leg": hedge_leg,
-            "sl_price": sl_price,
-            "target_price": target_price,
-            "time": now_ist().isoformat(),
-        })
-
-        if webhook_confirmed_ok(resp):
-            state["open_position"] = {
-                "short_leg": short_leg,
-                "hedge_leg": hedge_leg,
-                "sl_price": sl_price,
-                "target_price": target_price,
-                "entry_time": now_ist().isoformat(),
-            }
-            state["pending_signal"] = None
-            print(f"FILLED: SELL {short_leg['symbol']} @ {entry_price:.2f}, "
-                  f"hedge BUY {hedge_leg['symbol']}, SL={sl_price:.2f}, target={target_price:.2f}")
-        else:
-            print(
-                f"ENTRY webhook not confirmed for {short_leg['symbol']} -- "
-                "NOT recording as open position. Pending signal cleared (do not retry a stale fill).",
-                file=sys.stderr,
-            )
-            state["pending_signal"] = None
-
-    elif pending["candles_elapsed"] >= ENTRY_WINDOW_CANDLES:
-        print(f"Pending signal {strike}{option_type}: {ENTRY_WINDOW_CANDLES}-candle window elapsed, "
-              f"limit {limit_entry_price:.2f} never reached -- cancelling, no trade.")
-        state["pending_signal"] = None
-
-    return True
-
-
-def scan_for_new_signal(state, smart_api, instruments, expiry, strikes_to_check, atm,
-                         prev_day, prev_day_cache, today_start):
-    """
-    Checks each SHORT strike (ATM+-100 only -- hedge strikes ATM+-400 are
-    never signal-checked, they only get bought as a hedge on a short's
-    fill) for a fresh crossover trigger. On the first trigger found,
-    records a pending_signal (NOT yet a fill) and returns -- one signal is
-    pursued at a time.
-    """
+    # ---- No open position: look for a new entry signal ----
     for strike in strikes_to_check:
-        if not is_short_strike(strike, atm):
-            continue  # hedge strikes are never signal sources
-
         for opt_type in ["CE", "PE"]:
             token_info = ac.resolve_option_token(instruments, expiry, strike, opt_type)
             if not token_info:
@@ -719,75 +648,64 @@ def scan_for_new_signal(state, smart_api, instruments, expiry, strikes_to_check,
             if df is None:
                 continue
 
-            trigger_candle = check_crossover_trigger(df)
-            if trigger_candle:
-                state["pending_signal"] = {
+            signal_now = check_entry_signal(df)
+            # Backtest data collection -- mark only the last row (the one
+            # check_entry_signal() actually evaluated) as True/False; earlier
+            # rows in this df were already marked correctly on a prior run's
+            # save, so leave them as NA here and let the de-dupe in
+            # append_to_candle_history() prefer whichever save is later
+            # (last-row-of-each-run is always the most authoritative).
+            signal_mask = pd.Series([pd.NA] * (len(df) - 1) + [signal_now], index=df.index)
+            append_to_candle_history(df, token_info["symbol"], strike, opt_type, signal_fired_mask=signal_mask)
+
+            if signal_now:
+                trigger_candle = df.iloc[-1].to_dict()
+                entry_price = compute_entry_price(trigger_candle)
+                target_price = entry_price - 2 * (trigger_candle["high"] - entry_price)
+                entry_time = now_ist().isoformat()
+
+                position = {
+                    "symbol": token_info["symbol"],
+                    "token": token_info["token"],
                     "strike": strike,
                     "option_type": opt_type,
-                    "trigger_time": str(trigger_candle["time"]),
-                    "trigger_high": trigger_candle["high"],
-                    "trigger_vwap": trigger_candle["vwap"],
-                    "trigger_ema5": trigger_candle["ema5"],
-                    "limit_entry_price": None,   # computed next run, from N+1's open
-                    "candles_elapsed": 0,
+                    "entry_price": entry_price,
+                    "qty": LOT_SIZE,
+                    "target_price": target_price,
+                    "entry_time": entry_time,
                 }
-                print(f"SIGNAL: crossover trigger on {strike}{opt_type} at {trigger_candle['time']} "
-                      f"-- awaiting next candle's open to set limit price.")
-                save_state(state)
+
+                resp = send_to_webhook({
+                    "action": "ENTRY",
+                    "side": "SELL",
+                    "symbol": position["symbol"],
+                    "qty": LOT_SIZE,
+                    "price": entry_price,
+                    "target_price": target_price,
+                    "time": entry_time,
+                })
+
+                # FIX (1.4): only record the position as open if the webhook
+                # confirmed it. Otherwise the next run correctly sees
+                # open_position as None and will re-scan for entries instead
+                # of "managing" a position that was never actually placed.
+                if webhook_confirmed_ok(resp):
+                    state["open_position"] = position
+                    save_state(state)
+                    print(f"SIGNAL: SELL {position['symbol']} @ {entry_price}")
+                else:
+                    print(
+                        f"ENTRY webhook not confirmed for {position['symbol']} -- "
+                        "NOT recording as open position. Will re-evaluate next run.",
+                        file=sys.stderr,
+                    )
+                    save_state(state)
                 save_prev_day_cache(prev_day, prev_day_cache)
                 return
 
-
-def main():
-    if not is_market_open_now():
-        print("Market closed (outside hours or holiday) -- skipping run.")
-        return
-
-    state = load_state()
-    state.setdefault("pending_signal", None)
-    send_heartbeat_if_needed(state)
-    save_state(state)  # persist heartbeat_date immediately, don't wait for end of run
-
-    smart_api = ac.login()
-    instruments = ac.download_instrument_master()
-
-    expiry = get_current_weekly_expiry()
-
-    atm, strikes_to_check, spot_price_at_lock = get_or_set_daily_strikes(state, smart_api)
-    if atm is None:
-        if now_ist().time() < STRIKE_LOCK_TIME:
-            print(f"Before {STRIKE_LOCK_TIME.strftime('%H:%M')} strike-lock time -- skipping signal check this run.")
-        else:
-            print("Could not fetch spot price to lock today's strikes, aborting this run.", file=sys.stderr)
-        return
-    if spot_price_at_lock is not None:
-        print(f"Locked today's strikes: ATM={atm} (spot={spot_price_at_lock}) -> {strikes_to_check}")
-
-    prev_day = previous_trading_day(now_ist().date())
-    prev_day_cache = load_prev_day_cache(prev_day)
-    today_start = dt.datetime.combine(now_ist().date(), MARKET_OPEN)
-
-    save_state(state)  # persist today's locked strikes immediately
-
-    # ---- Priority 1: manage an existing open position ----
-    if state["open_position"] is not None:
-        manage_open_position(state, smart_api, instruments, expiry, prev_day, prev_day_cache, today_start)
-        return
-
-    # ---- Priority 2: advance a pending signal awaiting fill ----
-    if state["pending_signal"] is not None:
-        manage_pending_signal(state, smart_api, instruments, expiry, atm, prev_day, prev_day_cache, today_start)
-        save_state(state)
-        save_prev_day_cache(prev_day, prev_day_cache)
-        return
-
-    # ---- Priority 3: no position, no pending signal -- scan for a new trigger ----
-    scan_for_new_signal(state, smart_api, instruments, expiry, strikes_to_check, atm,
-                         prev_day, prev_day_cache, today_start)
-
     save_state(state)
     save_prev_day_cache(prev_day, prev_day_cache)
-    print("No new trigger this run.")
+    print("No entry signal this run.")
 
 
 if __name__ == "__main__":
