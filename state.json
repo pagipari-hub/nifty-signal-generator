@@ -1,6 +1,6 @@
 {
   "open_position": null,
-  "last_run": "2026-06-30T13:11:12.901176+05:30",
+  "last_run": "2026-06-30T13:15:55.346672+05:30",
   "heartbeat_date": "2026-06-30",
   "daily_strikes_date": "2026-06-30",
   "daily_atm": 23900,
@@ -9,5 +9,6 @@
     23800,
     24000,
     24300
-  ]
+  ],
+  "pending_signal": null
 }
