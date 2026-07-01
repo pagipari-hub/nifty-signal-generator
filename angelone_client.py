@@ -22,7 +22,7 @@ import datetime as dt
 
 import pyotp
 import requests
-from SmartConnect import SmartConnect
+from SmartApi import SmartConnect
 from smartExceptions import DataException
 
 INSTRUMENT_MASTER_URL = (
