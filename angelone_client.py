@@ -22,19 +22,15 @@ import datetime as dt
 
 import pyotp
 import requests
-from SmartApi import SmartConnect
-from SmartApi.smartExceptions import DataException
+from SmartConnect import SmartConnect
+from smartExceptions import DataException
 
 INSTRUMENT_MASTER_URL = (
     "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
 )
 INSTRUMENT_MASTER_CACHE = "instrument_master.json"
 
-# Angel One's rate limiter is known to be flakier than their published
-# limits suggest -- developers report "Access denied because of exceeding
-# access rate" even when well under the documented per-second cap. So we
-# (a) add a small delay before hitting rate-limited endpoints, and
-# (b) retry with backoff if we still get throttled.
+# Angel One's rate limiter mitigation configurations
 RATE_LIMIT_RETRY_ATTEMPTS = 3
 RATE_LIMIT_RETRY_DELAY_SECONDS = 3
 PRE_CALL_DELAY_SECONDS = 1.5
@@ -93,8 +89,7 @@ def download_instrument_master(force_refresh=False):
     exact 'symbol' and 'token' Angel One expects -- never guess the format.
     """
     if not force_refresh and os.path.exists(INSTRUMENT_MASTER_CACHE):
-        # Cache for the trading day -- re-download once per day, not every run,
-        # since this file is large (~tens of MB) and doesn't change intraday.
+        # Cache for the trading day -- verified via workflow dates
         mtime = dt.datetime.fromtimestamp(os.path.getmtime(INSTRUMENT_MASTER_CACHE))
         if mtime.date() == dt.date.today():
             with open(INSTRUMENT_MASTER_CACHE, "r") as f:
@@ -114,24 +109,15 @@ def download_instrument_master(force_refresh=False):
 def resolve_option_token(instruments, expiry_date, strike, option_type):
     """
     Looks up the exact Angel One 'symbol', 'token', and 'lot_size' for a
-    NIFTY weekly option from the instrument master list (NOT a guessed
-    string format).
+    NIFTY weekly option from the instrument master list.
 
-    expiry_date: datetime.date
-    strike: int, e.g. 24400
-    option_type: "CE" or "PE"
-
-    Returns dict {"symbol": ..., "token": ..., "lot_size": int} or None if
-    not found.
-
-    lot_size is read directly from the master JSON's 'lotsize' field (which
-    Angel One stores as a string, so we cast it to int here). This means
-    the script automatically picks up any future NSE lot size revision the
-    moment new contracts appear in the master JSON -- no manual code change
-    needed. Fallback is 65 (current value per NSE circular NSE/FAOP/70616,
-    effective January 2026) in case the field is ever missing.
+    FIX (Formatting Anchor): Angel One's master JSON strings strip leading zeros
+    from the day field (e.g., '02JUL2026' is stored natively as '2JUL2026').
+    Using explicit int casting on '%d' cleanly eliminates padding conflicts.
     """
-    expiry_str = expiry_date.strftime("%d%b%Y").upper()  # e.g. 25JUN2026
+    day_str = str(int(expiry_date.strftime("%d")))
+    month_year_str = expiry_date.strftime("%b%Y").upper()
+    expiry_str = f"{day_str}{month_year_str}"  # Converts 02JUL2026 -> 2JUL2026
 
     for inst in instruments:
         if (
@@ -142,7 +128,8 @@ def resolve_option_token(instruments, expiry_date, strike, option_type):
             and inst.get("symbol", "").endswith(option_type)
         ):
             try:
-                inst_strike = float(inst.get("strike", -1)) / 100  # Angel One stores strike * 100
+                # Angel One stores strike metrics scaled up * 100
+                inst_strike = float(inst.get("strike", -1)) / 100  
             except (ValueError, TypeError):
                 continue
 
@@ -150,7 +137,7 @@ def resolve_option_token(instruments, expiry_date, strike, option_type):
                 return {
                     "symbol": inst.get("symbol"),
                     "token": inst.get("token"),
-                    "lot_size": int(inst.get("lotsize", 65)),  # string in master JSON; fallback 65 per NSE/FAOP/70616
+                    "lot_size": int(inst.get("lotsize", 65)),  # Fallback 65 per 2026 NSE requirements
                 }
 
     print(f"No match found for NIFTY {strike} {option_type} expiry {expiry_str}",
@@ -162,15 +149,6 @@ def fetch_5min_candles(smart_api, token, start_time=None, lookback_minutes=180):
     """
     Fetches 5-min OHLC candles for the given NFO token from Angel One.
     Returns list of dicts (oldest first): time, open, high, low, close, volume.
-
-    start_time: explicit datetime to fetch from (e.g. previous trading day's
-    market open), so EMA indicators have real history to warm up against
-    instead of restarting cold every morning. If not given, falls back to
-    a simple rolling lookback_minutes window (legacy behaviour).
-
-    Retries on Angel One's rate-limit errors (these happen even within
-    documented limits -- known flakiness on their end), with a short delay
-    beforehand to reduce the odds of hitting it in the first place.
     """
     now = dt.datetime.now()
     start = start_time if start_time is not None else now - dt.timedelta(minutes=lookback_minutes)
@@ -183,7 +161,7 @@ def fetch_5min_candles(smart_api, token, start_time=None, lookback_minutes=180):
         "todate": now.strftime("%Y-%m-%d %H:%M"),
     }
 
-    time.sleep(PRE_CALL_DELAY_SECONDS)  # breathing room after prior API calls
+    time.sleep(PRE_CALL_DELAY_SECONDS)  # Anti-throttling buffer spacing
 
     try:
         response = _call_with_retry(
@@ -200,7 +178,6 @@ def fetch_5min_candles(smart_api, token, start_time=None, lookback_minutes=180):
 
     candles = []
     for row in response.get("data", []):
-        # row format: [timestamp, open, high, low, close, volume]
         candles.append({
             "time": row[0],
             "open": float(row[1]),
@@ -216,11 +193,7 @@ def fetch_5min_candles(smart_api, token, start_time=None, lookback_minutes=180):
 def fetch_spot_ltp(smart_api):
     """
     Fetches NIFTY 50 index spot LTP, used to compute ATM strike.
-    NIFTY 50 index token on NSE is 99926000 (well-known, stable Angel One
-    constant -- not derived from instrument master since it's an index, not
-    a tradable instrument with an expiry).
-
-    Retries on Angel One's rate-limit errors, same as fetch_5min_candles.
+    Constant index identifier token used: 99926000
     """
     time.sleep(PRE_CALL_DELAY_SECONDS)
 
