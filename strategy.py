@@ -370,7 +370,7 @@ def main():
                         "short_strike": strike,
                         "short_symbol": token_info["symbol"],
                         "short_token": token_info["token"],
-                        "long_symbol": long_symbol_info := long_token_info["symbol"],
+                        "long_symbol": long_token_info["symbol"],
                         "long_token": long_token_info["token"],
                         "qty": token_info["lot_size"],
                         "entry_price": entry_limit_price,
