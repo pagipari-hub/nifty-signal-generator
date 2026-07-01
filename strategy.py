@@ -12,7 +12,6 @@ import angelone_client as ac
 STATE_FILE = "state.json"
 PREV_DAY_CACHE_FILE = "prev_day_candles.json"
 HOLIDAY_FILE = "nas_holidays.json"
-HISTORY_DIR = "candle_history"
 
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SHARED_SECRET")
@@ -25,26 +24,23 @@ MARKET_CLOSE = dt.time(15, 30)
 EOD_SQUAREOFF = dt.time(15, 20)
 STRIKE_LOCK_TIME = dt.time(9, 30)
 
-# Automatically guarantee output directory exists for workflow tracking
-os.makedirs(HISTORY_DIR, exist_ok=True)
-
 
 def get_now():
     """
-    Returns system time. Because the GitHub Actions workflow defines 
-    TZ: Asia/Kolkata, this natively returns correct Indian Standard Time (IST).
+    Returns system time natively. Works perfectly with the workflow's 
+    TZ: Asia/Kolkata environment variable to return accurate IST.
     """
     return dt.datetime.now()
 
 
 def load_market_holidays():
-    """Loads closed market dates from the localized repository JSON list."""
+    """Loads closed market dates from the dynamic JSON file list."""
     if os.path.exists(HOLIDAY_FILE):
         try:
             with open(HOLIDAY_FILE, "r") as f:
                 return set(json.load(f))
         except (json.JSONDecodeError, OSError):
-            print(f"Warning: {HOLIDAY_FILE} is corrupt or unreadable. Falling back.")
+            print(f"Warning: {HOLIDAY_FILE} is unreadable. Falling back.")
     return set()
 
 
@@ -72,10 +68,8 @@ def save_state(state):
 
 
 def is_trading_day(date_obj):
-    # Check weekends first
     if date_obj.weekday() >= 5:
         return False
-    # Check holiday registry strings
     return date_obj.date().isoformat() not in MARKET_HOLIDAYS
 
 
@@ -99,7 +93,7 @@ def is_eod_squareoff_time():
 
 def get_current_weekly_expiry():
     today = get_now().date()
-    days_ahead = (1 - today.weekday()) % 7  # Tuesday target per exchange parameters
+    days_ahead = (1 - today.weekday()) % 7  # Tuesday target parameter alignment
     expiry = today + dt.timedelta(days=days_ahead)
     while not is_trading_day(dt.datetime.combine(expiry, MARKET_OPEN)):
         expiry -= dt.timedelta(days=1)
@@ -123,7 +117,7 @@ def get_or_set_daily_strikes(state, smart_api):
         return None, None
 
     atm = get_atm_strike(spot_price)
-    strikes = [atm - 100, atm + 100]  # Target strategy anchors
+    strikes = [atm - 100, atm + 100]
 
     state["daily_strikes_date"] = today_str
     state["daily_atm"] = atm
@@ -201,7 +195,6 @@ def check_entry_signal(df):
     candle_t = df.loc[idx_t]
     candle_prev = df.loc[idx_t - 1]
 
-    # Crossover condition check: EMA5 crossed under VWAP cleanly on closed candle T
     was_above = candle_prev["ema5"] >= candle_prev["vwap"]
     is_below = candle_t["ema5"] < candle_t["vwap"]
 
@@ -211,10 +204,6 @@ def check_entry_signal(df):
 
 
 def calculate_custom_ema5_open(df, idx_t, next_open_price):
-    """
-    Derives the dynamic, forward-looking EMA5 at the boundary shift.
-    Seeds Candle T+1's Open print directly into the 26 historical lookback array.
-    """
     multiplier = 2 / (5 + 1)
     ema5_t = df.loc[idx_t, "ema5"]
     ema5_open = (next_open_price * multiplier) + (ema5_t * (1 - multiplier))
@@ -223,7 +212,7 @@ def calculate_custom_ema5_open(df, idx_t, next_open_price):
 
 def send_to_webhook(payload):
     if not WEBHOOK_URL:
-        print("WEBHOOK_URL environment secret missing. Payload:", payload)
+        print("WEBHOOK_URL env secret missing. Payload:", payload)
         return None
 
     headers = {"Content-Type": "application/json"}
@@ -320,7 +309,6 @@ def main():
                     continue
                 next_candle_open = live_candles[-1]["open"]
 
-                # Run custom boundary calculations
                 ema5_open = calculate_custom_ema5_open(df, idx_t, next_candle_open)
                 entry_limit_price = float(round(ema5_open * 0.95, 2))
 
@@ -330,7 +318,6 @@ def main():
                 risk_amount = sl_price - entry_limit_price
                 target_price = float(round(entry_limit_price - (2 * risk_amount), 2))
 
-                # Identify protection hedge leg parameters (ATM +- 400)
                 long_strike = strike + 300 if opt_type == "CE" else strike - 300
                 long_token_info = ac.resolve_option_token(instruments, expiry, long_strike, opt_type)
                 if not long_token_info:
@@ -339,7 +326,6 @@ def main():
                 long_live_candles = ac.fetch_5min_candles(smart_api, long_token_info["token"], start_time=today_start)
                 long_open = long_live_candles[-1]["open"] if long_live_candles else 0.0
 
-                # Package credit spread bundle matrix
                 spread_payload = {
                     "action": "ENTRY_SPREAD",
                     "option_type": opt_type,
@@ -352,16 +338,13 @@ def main():
                     "long_leg": {
                         "symbol": long_token_info["symbol"],
                         "token": long_token_info["token"],
-                        "limit_price": float(round(long_open * 1.05, 2)), # Buffer added to guarantee protective fill
+                        "limit_price": float(round(long_open * 1.05, 2)),
                         "qty": long_token_info["lot_size"]
                     },
                     "sl_price": sl_price,
                     "target_price": target_price,
                     "time": get_now().isoformat()
                 }
-
-                # Save raw frame snapshot for auditing verification inside candle_history/
-                df.to_json(f"{HISTORY_DIR}/{token_info['symbol']}_{get_now().date().isoformat()}.json")
 
                 resp = send_to_webhook(spread_payload)
                 if webhook_confirmed_ok(resp):
