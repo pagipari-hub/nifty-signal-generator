@@ -29,6 +29,10 @@ FIX LOG (production hardening pass):
     "whichever run happens to be first" -- previously a 9:15-9:29 run
     could lock strikes off an unsettled opening-range price. See
     get_or_set_daily_strikes() for full reasoning.
+  - LOT_SIZE hardcoded constant removed. Lot size is now read dynamically
+    from Angel One's instrument master JSON (the 'lotsize' field), so the
+    script automatically adapts to any future NSE revision without a code
+    change. Fallback is 65 per NSE circular NSE/FAOP/70616 (Jan 2026).
 
 NOT YET DONE (deliberately deferred -- depends on the Shoonya/webhook side):
   - A webhook HTTP 200 here still only means "the webhook accepted the
@@ -63,8 +67,11 @@ STATE_FILE = "state.json"
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL")  # set as a GitHub Secret
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SHARED_SECRET")  # simple auth between GH Action and webhook
 
-LOT_SIZE = 75  # NIFTY lot size -- confirm current value before going live;
-                # NSE revises this periodically.
+# LOT_SIZE is no longer a hardcoded constant here. It is read dynamically
+# from Angel One's instrument master JSON via resolve_option_token(), which
+# returns a 'lot_size' field. This means any future NSE revision is picked
+# up automatically the day new contracts appear in the master, with no code
+# change needed. See angelone_client.py -> resolve_option_token() for details.
 
 WEBHOOK_RETRY_ATTEMPTS = 3
 WEBHOOK_RETRY_DELAY_SECONDS = 2
@@ -113,79 +120,6 @@ STRIKE_LOCK_TIME = dt.time(9, 30)
 
 
 PREV_DAY_CACHE_FILE = "prev_day_candles.json"
-
-# Backtest data collection: every candle we already fetch for live signal
-# generation also gets appended to a per-day CSV under this folder. This is
-# NOT a separate fetch -- it's the same data the strategy already pulled,
-# just persisted so it accumulates into a usable backtest dataset over time.
-# Deliberately scoped to only the strikes we actually watch each day (no
-# extra API calls, no extra cost) -- see chat notes for why a full historical
-# backtest is a separate, bigger task than this.
-CANDLE_HISTORY_DIR = "candle_history"
-CANDLE_HISTORY_COLUMNS = [
-    "date", "time", "symbol", "strike", "option_type",
-    "open", "high", "low", "close", "volume",
-    "ema5", "ema25", "vwap", "signal_fired",
-]
-
-
-def append_to_candle_history(df, symbol, strike, option_type, signal_fired_mask=None):
-    """
-    Appends today's processed candles (with EMA5/EMA25/VWAP already computed
-    by compute_indicators()) to candle_history/<today>.csv, one row per
-    candle per contract. Safe to call multiple times per run/day for the
-    same contract -- de-duplicates on (time, symbol) so re-running the same
-    5-min window twice (e.g. two runs both seeing the 10:15 candle before
-    it's finalized) doesn't create duplicate rows.
-
-    signal_fired_mask: optional boolean Series aligned to df, marking which
-    rows had check_entry_signal() return True. If not given, signal_fired is
-    left blank for all rows (caller didn't have it handy) rather than
-    guessed -- guessing here would silently corrupt the backtest dataset.
-    """
-    if df is None or df.empty:
-        return
-
-    os.makedirs(CANDLE_HISTORY_DIR, exist_ok=True)
-    today_str = now_ist().date().isoformat()
-    path = os.path.join(CANDLE_HISTORY_DIR, f"{today_str}.csv")
-
-    out = pd.DataFrame({
-        "date": df["time"].dt.date.astype(str),
-        "time": df["time"].astype(str),
-        "symbol": symbol,
-        "strike": strike,
-        "option_type": option_type,
-        "open": df["open"],
-        "high": df["high"],
-        "low": df["low"],
-        "close": df["close"],
-        "volume": df["volume"],
-        "ema5": df["ema5"],
-        "ema25": df["ema25"],
-        "vwap": df["vwap"],
-        "signal_fired": signal_fired_mask if signal_fired_mask is not None else pd.NA,
-    })[CANDLE_HISTORY_COLUMNS]
-
-    if os.path.exists(path):
-        existing = pd.read_csv(path)
-        combined = pd.concat([existing, out], ignore_index=True)
-        # De-dupe on (time, symbol). signal_fired needs special handling:
-        # most rows in `out` carry NA for signal_fired (we only know the
-        # true/false value for the LAST row of whichever df the caller had
-        # this run -- earlier rows were already correctly recorded on a
-        # prior run). A naive keep="last" would let that NA overwrite a
-        # previously-recorded True/False. Instead: sort so real values
-        # (non-NA) sort before NA for the same (time, symbol), then keep
-        # the first -- i.e. prefer a known value over a blank one.
-        combined["_signal_is_na"] = combined["signal_fired"].isna()
-        combined = combined.sort_values(["symbol", "time", "_signal_is_na"])
-        combined = combined.drop_duplicates(subset=["time", "symbol"], keep="first")
-        combined = combined.drop(columns=["_signal_is_na"])
-        combined = combined.sort_values(["symbol", "time"]).reset_index(drop=True)
-        combined.to_csv(path, index=False)
-    else:
-        out.to_csv(path, index=False)
 
 
 def load_prev_day_cache(expected_date):
@@ -596,13 +530,6 @@ def main():
             candles = get_candles_with_cache(smart_api, token_info["token"], prev_day, prev_day_cache, today_start)
             df = compute_indicators(candles)
 
-            # Backtest data collection -- same df we're already using for
-            # SL/target checks, just persisted. signal_fired left blank here
-            # since this is the position-MANAGEMENT branch (we already have
-            # a position open on this contract; check_entry_signal() isn't
-            # being evaluated for it this run).
-            append_to_candle_history(df, pos["symbol"], pos["strike"], pos["option_type"])
-
             if df is not None:
                 last = df.iloc[-1]
                 sl_hit = last["close"] > last["vwap"]
@@ -614,7 +541,7 @@ def main():
                         "action": "EXIT",
                         "reason": reason,
                         "symbol": pos["symbol"],
-                        "qty": pos["qty"],
+                        "qty": pos["qty"],  # stored in position at entry time
                         "price": float(last["close"]),
                         "time": now_ist().isoformat(),
                     })
@@ -648,21 +575,12 @@ def main():
             if df is None:
                 continue
 
-            signal_now = check_entry_signal(df)
-            # Backtest data collection -- mark only the last row (the one
-            # check_entry_signal() actually evaluated) as True/False; earlier
-            # rows in this df were already marked correctly on a prior run's
-            # save, so leave them as NA here and let the de-dupe in
-            # append_to_candle_history() prefer whichever save is later
-            # (last-row-of-each-run is always the most authoritative).
-            signal_mask = pd.Series([pd.NA] * (len(df) - 1) + [signal_now], index=df.index)
-            append_to_candle_history(df, token_info["symbol"], strike, opt_type, signal_fired_mask=signal_mask)
-
-            if signal_now:
+            if check_entry_signal(df):
                 trigger_candle = df.iloc[-1].to_dict()
                 entry_price = compute_entry_price(trigger_candle)
                 target_price = entry_price - 2 * (trigger_candle["high"] - entry_price)
                 entry_time = now_ist().isoformat()
+                lot_size = token_info["lot_size"]  # from instrument master, not a hardcoded constant
 
                 position = {
                     "symbol": token_info["symbol"],
@@ -670,7 +588,7 @@ def main():
                     "strike": strike,
                     "option_type": opt_type,
                     "entry_price": entry_price,
-                    "qty": LOT_SIZE,
+                    "qty": lot_size,
                     "target_price": target_price,
                     "entry_time": entry_time,
                 }
@@ -679,7 +597,7 @@ def main():
                     "action": "ENTRY",
                     "side": "SELL",
                     "symbol": position["symbol"],
-                    "qty": LOT_SIZE,
+                    "qty": lot_size,
                     "price": entry_price,
                     "target_price": target_price,
                     "time": entry_time,
@@ -692,7 +610,7 @@ def main():
                 if webhook_confirmed_ok(resp):
                     state["open_position"] = position
                     save_state(state)
-                    print(f"SIGNAL: SELL {position['symbol']} @ {entry_price}")
+                    print(f"SIGNAL: SELL {position['symbol']} @ {entry_price} qty={lot_size}")
                 else:
                     print(
                         f"ENTRY webhook not confirmed for {position['symbol']} -- "
