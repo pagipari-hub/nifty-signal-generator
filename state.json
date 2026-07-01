@@ -1,14 +1,23 @@
 {
-  "open_position": null,
-  "last_run": "2026-07-01T09:25:28.050689+05:30",
+  "open_position": {
+    "symbol": "NIFTY07JUL2624350CE",
+    "token": "44649",
+    "strike": 24350,
+    "option_type": "CE",
+    "entry_price": 36.82,
+    "qty": 75,
+    "target_price": 33.160000000000004,
+    "entry_time": "2026-07-01T09:32:24.399436+05:30"
+  },
+  "last_run": "2026-07-01T09:32:47.324163+05:30",
   "heartbeat_date": "2026-07-01",
-  "daily_strikes_date": "2026-06-30",
-  "daily_atm": 23900,
+  "daily_strikes_date": "2026-07-01",
+  "daily_atm": 23950,
   "daily_strikes": [
-    23500,
-    23800,
-    24000,
-    24300
+    23550,
+    23850,
+    24050,
+    24350
   ],
   "pending_signal": null
 }
