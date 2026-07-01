@@ -1,6 +1,15 @@
 {
-  "open_position": null,
-  "last_run": "2026-07-01T11:10:40.614053+05:30",
+  "open_position": {
+    "symbol": "NIFTY07JUL2624050PE",
+    "token": "44623",
+    "strike": 24050,
+    "option_type": "PE",
+    "entry_price": 161.04,
+    "qty": 65,
+    "target_price": 151.92,
+    "entry_time": "2026-07-01T11:16:11.648659+05:30"
+  },
+  "last_run": "2026-07-01T11:16:12.612596+05:30",
   "heartbeat_date": "2026-07-01",
   "daily_strikes_date": "2026-07-01",
   "daily_atm": 23950,
