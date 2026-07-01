@@ -1,16 +1,5 @@
 {
-  "open_position":null {
-    "option_type": "PE",
-    "short_strike": 24050,
-    "short_symbol": "NIFTY07JUL2624050PE",
-    "short_token": "44623",
-    "long_symbol": "NIFTY07JUL2623750PE",
-    "long_token": "44615",
-    "qty": 65,
-    "entry_price": 161.04,
-    "sl_price": 165.60,
-    "target_price": 151.92
-  },
+  "open_position": null,
   "last_run": "2026-07-01T11:25:35.466509+05:30",
   "heartbeat_date": "2026-07-01",
   "daily_strikes_date": "2026-07-01",
