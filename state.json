@@ -11,7 +11,7 @@
     "sl_price": 165.60,
     "target_price": 151.92
   },
-  "last_run": "2026-07-01T11:25:35.466509+05:30",
+  "last_run": "2026-07-01T12:45:32.000000",
   "heartbeat_date": "2026-07-01",
   "daily_strikes_date": "2026-07-01",
   "daily_atm": 23950,
@@ -20,4 +20,5 @@
     24050
   ],
   "pending_signal": null
+}
 }
