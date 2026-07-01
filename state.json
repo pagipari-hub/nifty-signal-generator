@@ -1,8 +1,11 @@
 {
   "open_position": null,
-  "last_run": null,
+  "last_run": "2026-07-01T12:30:53.730007",
   "heartbeat_date": null,
-  "daily_strikes_date": null,
-  "daily_atm": null,
-  "daily_strikes": null
+  "daily_strikes_date": "2026-07-01",
+  "daily_atm": 24000,
+  "daily_strikes": [
+    23900,
+    24100
+  ]
 }
