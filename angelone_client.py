@@ -22,8 +22,10 @@ import datetime as dt
 
 import pyotp
 import requests
+# Change this:
+# To this exact case-sensitive format:
 from SmartApi import SmartConnect
-from smartExceptions import DataException
+from SmartApi.smartExceptions import DataException
 
 INSTRUMENT_MASTER_URL = (
     "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
