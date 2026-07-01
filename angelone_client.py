@@ -113,14 +113,23 @@ def download_instrument_master(force_refresh=False):
 
 def resolve_option_token(instruments, expiry_date, strike, option_type):
     """
-    Looks up the exact Angel One 'symbol' and 'token' for a NIFTY weekly
-    option from the instrument master list (NOT a guessed string format).
+    Looks up the exact Angel One 'symbol', 'token', and 'lot_size' for a
+    NIFTY weekly option from the instrument master list (NOT a guessed
+    string format).
 
     expiry_date: datetime.date
     strike: int, e.g. 24400
     option_type: "CE" or "PE"
 
-    Returns dict {"symbol": ..., "token": ...} or None if not found.
+    Returns dict {"symbol": ..., "token": ..., "lot_size": int} or None if
+    not found.
+
+    lot_size is read directly from the master JSON's 'lotsize' field (which
+    Angel One stores as a string, so we cast it to int here). This means
+    the script automatically picks up any future NSE lot size revision the
+    moment new contracts appear in the master JSON -- no manual code change
+    needed. Fallback is 65 (current value per NSE circular NSE/FAOP/70616,
+    effective January 2026) in case the field is ever missing.
     """
     expiry_str = expiry_date.strftime("%d%b%Y").upper()  # e.g. 25JUN2026
 
@@ -138,7 +147,11 @@ def resolve_option_token(instruments, expiry_date, strike, option_type):
                 continue
 
             if int(inst_strike) == int(strike):
-                return {"symbol": inst.get("symbol"), "token": inst.get("token")}
+                return {
+                    "symbol": inst.get("symbol"),
+                    "token": inst.get("token"),
+                    "lot_size": int(inst.get("lotsize", 65)),  # string in master JSON; fallback 65 per NSE/FAOP/70616
+                }
 
     print(f"No match found for NIFTY {strike} {option_type} expiry {expiry_str}",
           file=sys.stderr)
