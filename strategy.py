@@ -26,15 +26,10 @@ STRIKE_LOCK_TIME = dt.time(9, 30)
 
 
 def get_now():
-    """
-    Returns system time natively. Works perfectly with the workflow's 
-    TZ: Asia/Kolkata environment variable to return accurate IST.
-    """
     return dt.datetime.now()
 
 
 def load_market_holidays():
-    """Loads closed market dates from the dynamic JSON file list."""
     if os.path.exists(HOLIDAY_FILE):
         try:
             with open(HOLIDAY_FILE, "r") as f:
@@ -93,7 +88,7 @@ def is_eod_squareoff_time():
 
 def get_current_weekly_expiry():
     today = get_now().date()
-    days_ahead = (1 - today.weekday()) % 7  # Tuesday target parameter alignment
+    days_ahead = (1 - today.weekday()) % 7
     expiry = today + dt.timedelta(days=days_ahead)
     while not is_trading_day(dt.datetime.combine(expiry, MARKET_OPEN)):
         expiry -= dt.timedelta(days=1)
