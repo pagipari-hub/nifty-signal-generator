@@ -173,12 +173,19 @@ def get_or_set_daily_strikes(state, smart_api):
     today_str = now_ist().date().isoformat()
 
     if state.get("daily_strikes_date") == today_str and state.get("daily_atm") is not None:
-        # Rebuild from the locked ATM rather than trusting daily_strikes on
-        # disk verbatim -- handles state.json written before this change
-        # (which stored the old flat 4-strike list) without needing to
-        # re-lock or re-fetch spot.
+        # FIX: rebuild AND rewrite state["daily_strikes"] on every run, not
+        # just the first lock of the day. Previously this branch computed
+        # leg_pairs in memory for the return value but never touched
+        # state["daily_strikes"] on disk -- so a state.json already locked
+        # under the old flat 4-strike format (e.g. mid-rollout) would keep
+        # showing that stale format all day, only self-correcting at the
+        # next day's fresh 9:30 lock. Rewriting it here is free (pure
+        # computation from daily_atm, no API call) and makes state.json
+        # self-consistent with the current code from the very next run.
         atm = state["daily_atm"]
-        return atm, build_leg_pairs(atm), None
+        leg_pairs = build_leg_pairs(atm)
+        state["daily_strikes"] = leg_pairs
+        return atm, leg_pairs, None
 
     if now_ist().time() < STRIKE_LOCK_TIME:
         return None, None, None
