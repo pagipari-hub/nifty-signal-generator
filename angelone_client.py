@@ -18,6 +18,7 @@ import os
 import sys
 import json
 import time
+import random
 import datetime as dt
 
 import pyotp
@@ -30,13 +31,38 @@ INSTRUMENT_MASTER_URL = (
 )
 INSTRUMENT_MASTER_CACHE = "instrument_master.json"
 
-RATE_LIMIT_RETRY_ATTEMPTS = 3
-RATE_LIMIT_RETRY_DELAY_SECONDS = 3
+# FIX (rate-limit retry rework): the old retry config (3 attempts, flat 3s
+# delay) was tuned as if Angel One only enforced a per-second cap. Their
+# own forum confirms getCandleData also has a per-MINUTE cap (~180/min)
+# on top of the per-second one, and there are widespread reports of
+# "exceeding access rate" firing even under the documented per-second
+# limit -- consistent with the cap being enforced per API key across ALL
+# concurrent sessions, not just the current process. A flat 3s x 3
+# attempts (9s total) can never clear a per-minute window that's already
+# been exhausted by an overlapping run. Switched to exponential backoff
+# with jitter and a much longer ceiling so a retry sequence can actually
+# survive a per-minute cap being hit, not just a per-second blip.
+RATE_LIMIT_RETRY_ATTEMPTS = 4
+RATE_LIMIT_BASE_DELAY_SECONDS = 5
+RATE_LIMIT_MAX_DELAY_SECONDS = 45
+RATE_LIMIT_JITTER_SECONDS = 2
 PRE_CALL_DELAY_SECONDS = 1.5
 
 
-def _call_with_retry(label, func, attempts=RATE_LIMIT_RETRY_ATTEMPTS,
-                      delay=RATE_LIMIT_RETRY_DELAY_SECONDS):
+def _rate_limit_backoff_delay(attempt):
+    """
+    Exponential backoff: 5s, 10s, 20s, 40s... capped at
+    RATE_LIMIT_MAX_DELAY_SECONDS, plus a small random jitter so multiple
+    retrying calls (e.g. across the several tokens fetched per run) don't
+    all retry in lockstep and re-collide on the same rate-limit window.
+    """
+    base = RATE_LIMIT_BASE_DELAY_SECONDS * (2 ** (attempt - 1))
+    capped = min(base, RATE_LIMIT_MAX_DELAY_SECONDS)
+    jitter = random.uniform(0, RATE_LIMIT_JITTER_SECONDS)
+    return capped + jitter
+
+
+def _call_with_retry(label, func, attempts=RATE_LIMIT_RETRY_ATTEMPTS):
     last_err = None
     for attempt in range(1, attempts + 1):
         try:
@@ -45,13 +71,20 @@ def _call_with_retry(label, func, attempts=RATE_LIMIT_RETRY_ATTEMPTS,
             last_err = e
             msg = str(e)
             if "exceeding access rate" in msg.lower() or "access denied" in msg.lower():
-                print(
-                    f"{label}: rate-limited (attempt {attempt}/{attempts}): {msg}",
-                    file=sys.stderr,
-                )
                 if attempt < attempts:
+                    delay = _rate_limit_backoff_delay(attempt)
+                    print(
+                        f"{label}: rate-limited (attempt {attempt}/{attempts}), "
+                        f"backing off {delay:.1f}s: {msg}",
+                        file=sys.stderr,
+                    )
                     time.sleep(delay)
                     continue
+                print(
+                    f"{label}: rate-limited (attempt {attempt}/{attempts}), "
+                    f"giving up: {msg}",
+                    file=sys.stderr,
+                )
             raise
     raise last_err
 
@@ -139,6 +172,15 @@ def resolve_option_token(instruments, expiry_date, strike, option_type):
 
 
 def fetch_5min_candles(smart_api, token, start_time=None, lookback_minutes=180):
+    # DEBUG (temporary -- investigating possible timezone mismatch): `now`
+    # here is dt.datetime.now(), i.e. whatever timezone the process's
+    # system clock is in. GitHub Actions runners default to UTC unless the
+    # workflow explicitly sets TZ=Asia/Kolkata, while Angel One's
+    # getCandleData expects fromdate/todate in IST. If the runner is UTC,
+    # `todate` sent below would be ~5.5 hours behind actual IST "now",
+    # which could silently truncate the candle window during market hours.
+    # Not changing behavior yet -- logging both clocks so this can be
+    # confirmed or ruled out from a live run's output first.
     now = dt.datetime.now()
     start = start_time if start_time is not None else now - dt.timedelta(minutes=lookback_minutes)
 
@@ -149,6 +191,13 @@ def fetch_5min_candles(smart_api, token, start_time=None, lookback_minutes=180):
         "fromdate": start.strftime("%Y-%m-%d %H:%M"),
         "todate": now.strftime("%Y-%m-%d %H:%M"),
     }
+
+    print(
+        f"[DEBUG] fetch_5min_candles token={token} "
+        f"system_now={now.isoformat()} (tzinfo={now.tzinfo}) "
+        f"params.fromdate={params['fromdate']} params.todate={params['todate']}",
+        file=sys.stderr,
+    )
 
     time.sleep(PRE_CALL_DELAY_SECONDS)
 
@@ -175,6 +224,21 @@ def fetch_5min_candles(smart_api, token, start_time=None, lookback_minutes=180):
             "close": float(row[4]),
             "volume": float(row[5]),
         })
+
+    # DEBUG (temporary): what's the actual latest candle Angel One handed
+    # back for this token, vs what we asked for as todate?
+    if candles:
+        print(
+            f"[DEBUG] token={token} latest candle returned: time={candles[-1]['time']} "
+            f"close={candles[-1]['close']} (requested todate={params['todate']})",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            f"[DEBUG] token={token} NO candles returned for range "
+            f"{params['fromdate']} -> {params['todate']}",
+            file=sys.stderr,
+        )
 
     return candles
 
