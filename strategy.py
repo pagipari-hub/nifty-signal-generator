@@ -42,6 +42,24 @@ WEBHOOK_SECRET = os.environ.get("WEBHOOK_SHARED_SECRET")
 WEBHOOK_RETRY_ATTEMPTS = 3
 WEBHOOK_RETRY_DELAY_SECONDS = 2
 
+# FIX (overlapping-run guard): the rate-limit errors traced back to a run
+# hitting getCandleData and immediately getting "exceeding access rate" on
+# its very first call -- before it could have exhausted any limit itself.
+# Angel One enforces rate limits per API key across ALL concurrent
+# sessions, so the likely cause is a previous 5-min run still mid-retry
+# (each retry now backs off up to 45s, so a run can legitimately take
+# longer than the 5-min cron interval) overlapping with the next
+# scheduled run and doubling up requests in the same window. A simple
+# file-based lock stops a new run from starting while a previous one is
+# still active, without needing any change to the GitHub Actions workflow
+# YAML (concurrency: settings there are a good belt-and-suspenders
+# addition too, but this guard works standalone).
+LOCK_FILE = "run.lock"
+LOCK_STALE_SECONDS = 240  # shorter than the 5-min cron interval, so a
+                          # legitimately-running process won't block the
+                          # *next* scheduled trigger, but a genuinely
+                          # crashed run's stale lock still gets cleared.
+
 NSE_HOLIDAYS_2026 = {
     dt.date(2026, 1, 26),
     dt.date(2026, 3, 3),
@@ -67,6 +85,35 @@ EOD_SQUAREOFF = dt.time(15, 20)
 STRIKE_LOCK_TIME = dt.time(9, 30)
 
 PREV_DAY_CACHE_FILE = "prev_day_candles.json"
+
+
+def acquire_run_lock():
+    """
+    Returns True if the lock was acquired (safe to proceed). Returns False
+    if a fresh lock already exists, meaning another run is still active.
+    A stale lock (older than LOCK_STALE_SECONDS -- i.e. from a run that
+    crashed without cleaning up) is cleared and re-acquired.
+    """
+    if os.path.exists(LOCK_FILE):
+        age = time.time() - os.path.getmtime(LOCK_FILE)
+        if age < LOCK_STALE_SECONDS:
+            return False
+        print(
+            f"Stale lock file found (age={age:.0f}s) -- previous run likely "
+            "crashed without cleaning up. Clearing it and proceeding.",
+            file=sys.stderr,
+        )
+
+    with open(LOCK_FILE, "w") as f:
+        f.write(f"{os.getpid()} {now_ist().isoformat()}")
+    return True
+
+
+def release_run_lock():
+    try:
+        os.remove(LOCK_FILE)
+    except OSError:
+        pass
 
 
 def load_prev_day_cache(expected_date):
@@ -254,7 +301,20 @@ def compute_indicators(candles):
     df = df[today_mask].reset_index(drop=True)
 
     if len(df) < 2:
+        print(
+            f"[DEBUG] compute_indicators: only {len(df)} today candle(s) available "
+            f"(need >=2) -- returning None. now_ist={now_ist().isoformat()}",
+            file=sys.stderr,
+        )
         return None
+
+    # DEBUG (temporary): confirm which candle is actually being treated as
+    # "latest completed" vs. the current wall-clock time this run executed.
+    print(
+        f"[DEBUG] compute_indicators: latest completed candle time="
+        f"{df.iloc[-1]['time']} | run time now_ist={now_ist().isoformat()}",
+        file=sys.stderr,
+    )
 
     return df
 
@@ -268,6 +328,94 @@ def check_entry_signal(df):
         and last["ema25"] > last["ema5"]
         and last["ema25"] > last["vwap"]
     )
+
+
+def log_signal_debug(symbol, df):
+    """
+    TEMPORARY debug helper (point 3 of the investigation). For each
+    scanned leg, prints a human-readable block:
+
+        Scanning <symbol>
+        Last candle: <HH:MM>
+        EMA5 = <value>
+        EMA25 = <value>
+        VWAP = <value>
+        EMA5 < VWAP : <bool>
+        EMA25 > EMA5 : <bool>      (only reached if the above was True)
+        EMA25 > VWAP : <bool>      (only reached if the above was True)
+        Signal = <bool>
+
+    Conditions are printed in the SAME order and with the SAME
+    short-circuiting as check_entry_signal()'s "and" chain -- once one
+    condition is False, the remaining ones aren't evaluated/printed and
+    we go straight to "Signal = False". This mirrors actual evaluation
+    order so the log tells you exactly which check blocked a signal.
+
+    Does not change any decision logic -- read-only observability,
+    called from scan_for_new_signal() for every leg scanned, not just
+    ones that fire.
+
+    Wrapped defensively: vwap can be pandas.NA (not NaN) on a candle with
+    zero cumulative volume -- e.g. a thinly-traded hedge leg's first
+    candle of the day -- because compute_indicators() does
+    `cum_vol.replace(0, pd.NA)` before dividing. VWAP is printed without
+    a ':.2f' spec for this reason (pd.NA doesn't support it). This is
+    pure logging; it must never be able to crash a real run that's
+    managing live positions, so any failure here is caught and reported
+    instead of propagated.
+    """
+    try:
+        last = df.iloc[-1]
+        candle_time = last["time"]
+        try:
+            candle_time_str = candle_time.strftime("%H:%M")
+        except AttributeError:
+            candle_time_str = str(candle_time)
+
+        ema5 = last["ema5"]
+        ema25 = last["ema25"]
+        vwap = last["vwap"]
+
+        print(f"Scanning {symbol}", file=sys.stderr)
+        print(f"Last candle: {candle_time_str}", file=sys.stderr)
+        print(f"EMA5 = {ema5:.2f}", file=sys.stderr)
+        print(f"EMA25 = {ema25:.2f}", file=sys.stderr)
+        print(f"VWAP = {vwap}", file=sys.stderr)
+
+        cond_ema5_below_vwap = bool(ema5 < vwap)
+        print(f"EMA5 < VWAP : {cond_ema5_below_vwap}", file=sys.stderr)
+        if not cond_ema5_below_vwap:
+            print("Signal = False", file=sys.stderr)
+            return
+
+        cond_ema25_above_ema5 = bool(ema25 > ema5)
+        print(f"EMA25 > EMA5 : {cond_ema25_above_ema5}", file=sys.stderr)
+        if not cond_ema25_above_ema5:
+            print("Signal = False", file=sys.stderr)
+            return
+
+        cond_ema25_above_vwap = bool(ema25 > vwap)
+        print(f"EMA25 > VWAP : {cond_ema25_above_vwap}", file=sys.stderr)
+
+        print(f"Signal = {cond_ema25_above_vwap}", file=sys.stderr)
+
+        # Extra context for investigation point 1 (state vs. crossover) --
+        # doesn't disturb the block above, just appends one more line when
+        # a signal actually fires, so we can tell a fresh cross apart from
+        # an already-established state.
+        if len(df) >= 2:
+            prev = df.iloc[-2]
+            prev_below = bool(prev["ema5"] < prev["vwap"])
+            print(
+                f"(prev candle EMA5 < VWAP : {prev_below} -> "
+                f"{'fresh crossover' if not prev_below else 'state already held'})",
+                file=sys.stderr,
+            )
+    except Exception as e:
+        # Never let a logging/formatting problem take down a run that's
+        # managing real positions. Report it and move on.
+        print(f"Scanning {symbol}: debug logging failed ({e!r}) -- "
+              "continuing without it.", file=sys.stderr)
 
 
 def compute_entry_price(trigger_candle):
@@ -553,6 +701,11 @@ def scan_for_new_signal(state, leg_pairs, instruments, expiry, smart_api, prev_d
         if df is None:
             continue
 
+        # DEBUG (temporary, point 3): log full condition breakdown for
+        # EVERY leg scanned this run, whether or not it fires, so it's
+        # clear which specific condition is blocking a signal on each side.
+        log_signal_debug(sell_token_info["symbol"], df)
+
         if check_entry_signal(df):
             hedge_token_info = ac.resolve_option_token(instruments, expiry, leg["hedge_strike"], leg["option_type"])
             if not hedge_token_info:
@@ -571,6 +724,18 @@ def scan_for_new_signal(state, leg_pairs, instruments, expiry, smart_api, prev_d
             p = state["pending_signal"]
             print(f"PENDING SIGNAL: SELL {p['sell_symbol']} resting limit @ {p['entry_limit']:.2f} "
                   f"(SL={p['sl_price']:.2f}, target={p['target_price']:.2f})")
+            # DEBUG (temporary, point 4): confirm this early return is what
+            # stops the other leg (CE/PE) from being scanned in the same
+            # run once one side has fired. state["pending_signal"] /
+            # state["open_position"] are single dicts, not lists, so the
+            # other leg is intentionally deferred to a later run rather
+            # than evaluated now -- see investigation notes.
+            print(
+                f"[DEBUG] scan_for_new_signal: stopping after {p['sell_symbol']} -- "
+                "remaining leg(s) in this run's leg_pairs were not scanned "
+                "(single pending_signal slot in state.json).",
+                file=sys.stderr,
+            )
             return
 
     print("No entry signal this run.")
@@ -618,58 +783,74 @@ def main():
         print("Market closed (outside hours or holiday) -- skipping run.")
         return
 
-    state = load_state()
-    send_heartbeat_if_needed(state)
-    save_state(state)
-
-    smart_api = ac.login()
-    instruments = ac.download_instrument_master()
-
-    expiry = get_current_weekly_expiry()
-
-    atm, leg_pairs, spot_price_at_lock = get_or_set_daily_strikes(state, smart_api)
-    if atm is None:
-        if now_ist().time() < STRIKE_LOCK_TIME:
-            print(f"Before {STRIKE_LOCK_TIME.strftime('%H:%M')} strike-lock time -- skipping signal check this run.")
-        else:
-            print("Could not fetch spot price to lock today's strikes, aborting this run.", file=sys.stderr)
+    # FIX (overlapping-run guard): acquire the lock before doing any API
+    # work. If a previous run is still active (fresh lock present), skip
+    # this run entirely rather than firing a second concurrent session at
+    # Angel One under the same API key -- see LOCK_FILE comment above for
+    # why this was the likely root cause of the rate-limit errors.
+    if not acquire_run_lock():
+        print(
+            "Another run appears to still be in progress (lock file is fresh) -- "
+            "skipping this run to avoid overlapping Angel One sessions / rate limiting.",
+            file=sys.stderr,
+        )
         return
-    if spot_price_at_lock is not None:
-        print(f"Locked today's strikes: ATM={atm} (spot={spot_price_at_lock}) -> {leg_pairs}")
 
-    prev_day = previous_trading_day(now_ist().date())
-    prev_day_cache = load_prev_day_cache(prev_day)
-    today_start = dt.datetime.combine(now_ist().date(), MARKET_OPEN)
+    try:
+        state = load_state()
+        send_heartbeat_if_needed(state)
+        save_state(state)
 
-    save_state(state)
+        smart_api = ac.login()
+        instruments = ac.download_instrument_master()
 
-    # ---- Manage existing open position first ----
-    if state["open_position"] is not None:
-        pos = state["open_position"]
-        if pos.get("spread"):
-            manage_spread_exit(state, pos, instruments, expiry, smart_api, prev_day, prev_day_cache, today_start)
-        else:
-            # FIX (backward compatibility): a position opened before this
-            # rework has no "spread" key -- it must keep being managed by
-            # the OLD dynamic-SL, single-leg exit logic untouched, not the
-            # new fixed-SL spread logic. See manage_legacy_single_leg_exit().
-            manage_legacy_single_leg_exit(state, pos, instruments, expiry, smart_api, prev_day, prev_day_cache, today_start)
+        expiry = get_current_weekly_expiry()
+
+        atm, leg_pairs, spot_price_at_lock = get_or_set_daily_strikes(state, smart_api)
+        if atm is None:
+            if now_ist().time() < STRIKE_LOCK_TIME:
+                print(f"Before {STRIKE_LOCK_TIME.strftime('%H:%M')} strike-lock time -- skipping signal check this run.")
+            else:
+                print("Could not fetch spot price to lock today's strikes, aborting this run.", file=sys.stderr)
+            return
+        if spot_price_at_lock is not None:
+            print(f"Locked today's strikes: ATM={atm} (spot={spot_price_at_lock}) -> {leg_pairs}")
+
+        prev_day = previous_trading_day(now_ist().date())
+        prev_day_cache = load_prev_day_cache(prev_day)
+        today_start = dt.datetime.combine(now_ist().date(), MARKET_OPEN)
 
         save_state(state)
-        save_prev_day_cache(prev_day, prev_day_cache)
-        return
 
-    # ---- No open position: manage a resting pending_signal, if any ----
-    if state.get("pending_signal") is not None:
-        manage_pending_signal(state, instruments, expiry, smart_api, prev_day, prev_day_cache, today_start)
+        # ---- Manage existing open position first ----
+        if state["open_position"] is not None:
+            pos = state["open_position"]
+            if pos.get("spread"):
+                manage_spread_exit(state, pos, instruments, expiry, smart_api, prev_day, prev_day_cache, today_start)
+            else:
+                # FIX (backward compatibility): a position opened before this
+                # rework has no "spread" key -- it must keep being managed by
+                # the OLD dynamic-SL, single-leg exit logic untouched, not the
+                # new fixed-SL spread logic. See manage_legacy_single_leg_exit().
+                manage_legacy_single_leg_exit(state, pos, instruments, expiry, smart_api, prev_day, prev_day_cache, today_start)
+
+            save_state(state)
+            save_prev_day_cache(prev_day, prev_day_cache)
+            return
+
+        # ---- No open position: manage a resting pending_signal, if any ----
+        if state.get("pending_signal") is not None:
+            manage_pending_signal(state, instruments, expiry, smart_api, prev_day, prev_day_cache, today_start)
+            save_state(state)
+            save_prev_day_cache(prev_day, prev_day_cache)
+            return
+
+        # ---- No position, no pending signal: scan for a fresh entry trigger ----
+        scan_for_new_signal(state, leg_pairs, instruments, expiry, smart_api, prev_day, prev_day_cache, today_start)
         save_state(state)
         save_prev_day_cache(prev_day, prev_day_cache)
-        return
-
-    # ---- No position, no pending signal: scan for a fresh entry trigger ----
-    scan_for_new_signal(state, leg_pairs, instruments, expiry, smart_api, prev_day, prev_day_cache, today_start)
-    save_state(state)
-    save_prev_day_cache(prev_day, prev_day_cache)
+    finally:
+        release_run_lock()
 
 
 if __name__ == "__main__":
