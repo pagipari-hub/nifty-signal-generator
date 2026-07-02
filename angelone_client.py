@@ -22,8 +22,6 @@ import datetime as dt
 
 import pyotp
 import requests
-# Change this:
-# To this exact case-sensitive format:
 from SmartApi import SmartConnect
 from SmartApi.smartExceptions import DataException
 
@@ -32,7 +30,6 @@ INSTRUMENT_MASTER_URL = (
 )
 INSTRUMENT_MASTER_CACHE = "instrument_master.json"
 
-# Angel One's rate limiter mitigation configurations
 RATE_LIMIT_RETRY_ATTEMPTS = 3
 RATE_LIMIT_RETRY_DELAY_SECONDS = 3
 PRE_CALL_DELAY_SECONDS = 1.5
@@ -40,12 +37,6 @@ PRE_CALL_DELAY_SECONDS = 1.5
 
 def _call_with_retry(label, func, attempts=RATE_LIMIT_RETRY_ATTEMPTS,
                       delay=RATE_LIMIT_RETRY_DELAY_SECONDS):
-    """
-    Calls func() and retries on Angel One rate-limit errors (DataException
-    with 'exceeding access rate' in the message, or a JSON decode failure
-    caused by the same root cause). Re-raises on the final attempt, or
-    immediately for any other kind of error.
-    """
     last_err = None
     for attempt in range(1, attempts + 1):
         try:
@@ -85,13 +76,7 @@ def login():
 
 
 def download_instrument_master(force_refresh=False):
-    """
-    Downloads (or loads cached) Angel One's official instrument master JSON.
-    This is the ONLY reliable way to resolve a strike+expiry+CE/PE to the
-    exact 'symbol' and 'token' Angel One expects -- never guess the format.
-    """
     if not force_refresh and os.path.exists(INSTRUMENT_MASTER_CACHE):
-        # Cache for the trading day -- verified via workflow dates
         mtime = dt.datetime.fromtimestamp(os.path.getmtime(INSTRUMENT_MASTER_CACHE))
         if mtime.date() == dt.date.today():
             with open(INSTRUMENT_MASTER_CACHE, "r") as f:
@@ -113,13 +98,20 @@ def resolve_option_token(instruments, expiry_date, strike, option_type):
     Looks up the exact Angel One 'symbol', 'token', and 'lot_size' for a
     NIFTY weekly option from the instrument master list.
 
-    FIX (Formatting Anchor): Angel One's master JSON strings strip leading zeros
-    from the day field (e.g., '02JUL2026' is stored natively as '2JUL2026').
-    Using explicit int casting on '%d' cleanly eliminates padding conflicts.
+    FIX (reverted the day-stripping change): a prior "fix" here assumed
+    Angel One's master JSON strips leading zeros from the expiry day
+    field and built expiry_str as e.g. "7JUL2026" instead of "07JUL2026".
+    That assumption was wrong -- it broke every strike lookup on
+    single-digit-day expiries (e.g. 2026-07-07), since it silently never
+    matched anything and just returned None with a "No match found" log
+    line. Confirmed wrong two ways: (1) the historically successful trade
+    NIFTY07JUL2624050PE was resolved correctly under the original
+    zero-padded logic, before that change landed; (2) real tradingsymbols
+    in candle_history (e.g. NIFTY07JUL2623550CE) use a zero-padded day.
+    Standard strftime("%d%b%Y") already zero-pads correctly -- no manual
+    int-cast stripping needed.
     """
-    day_str = str(int(expiry_date.strftime("%d")))
-    month_year_str = expiry_date.strftime("%b%Y").upper()
-    expiry_str = f"{day_str}{month_year_str}"  # Converts 02JUL2026 -> 2JUL2026
+    expiry_str = expiry_date.strftime("%d%b%Y").upper()  # e.g. 07JUL2026
 
     for inst in instruments:
         if (
@@ -130,8 +122,7 @@ def resolve_option_token(instruments, expiry_date, strike, option_type):
             and inst.get("symbol", "").endswith(option_type)
         ):
             try:
-                # Angel One stores strike metrics scaled up * 100
-                inst_strike = float(inst.get("strike", -1)) / 100  
+                inst_strike = float(inst.get("strike", -1)) / 100
             except (ValueError, TypeError):
                 continue
 
@@ -139,7 +130,7 @@ def resolve_option_token(instruments, expiry_date, strike, option_type):
                 return {
                     "symbol": inst.get("symbol"),
                     "token": inst.get("token"),
-                    "lot_size": int(inst.get("lotsize", 65)),  # Fallback 65 per 2026 NSE requirements
+                    "lot_size": int(inst.get("lotsize", 65)),
                 }
 
     print(f"No match found for NIFTY {strike} {option_type} expiry {expiry_str}",
@@ -148,10 +139,6 @@ def resolve_option_token(instruments, expiry_date, strike, option_type):
 
 
 def fetch_5min_candles(smart_api, token, start_time=None, lookback_minutes=180):
-    """
-    Fetches 5-min OHLC candles for the given NFO token from Angel One.
-    Returns list of dicts (oldest first): time, open, high, low, close, volume.
-    """
     now = dt.datetime.now()
     start = start_time if start_time is not None else now - dt.timedelta(minutes=lookback_minutes)
 
@@ -163,7 +150,7 @@ def fetch_5min_candles(smart_api, token, start_time=None, lookback_minutes=180):
         "todate": now.strftime("%Y-%m-%d %H:%M"),
     }
 
-    time.sleep(PRE_CALL_DELAY_SECONDS)  # Anti-throttling buffer spacing
+    time.sleep(PRE_CALL_DELAY_SECONDS)
 
     try:
         response = _call_with_retry(
@@ -193,10 +180,6 @@ def fetch_5min_candles(smart_api, token, start_time=None, lookback_minutes=180):
 
 
 def fetch_spot_ltp(smart_api):
-    """
-    Fetches NIFTY 50 index spot LTP, used to compute ATM strike.
-    Constant index identifier token used: 99926000
-    """
     time.sleep(PRE_CALL_DELAY_SECONDS)
 
     try:
