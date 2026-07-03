@@ -136,6 +136,25 @@ def save_prev_day_cache(date, candles_by_token):
 
 
 def get_candles_with_cache(smart_api, token, prev_day, prev_day_cache, today_start):
+    """
+    FIX (empty-cache poisoning, 2026-07-03): previously this cached
+    whatever fetch_5min_candles() returned unconditionally -- including
+    an empty list from a rate-limit failure. Once that empty result got
+    written into prev_day_cache[token_str] and persisted to
+    prev_day_candles.json via save_prev_day_cache(), every later run
+    THAT DAY would see the token already "in" the cache and skip
+    re-fetching entirely -- permanently starving that token of
+    previous-day candles for the rest of the day, with no retry. This is
+    exactly what produced a prev_day_candles.json labeled with the
+    correct date (e.g. 2026-07-02) but silently empty candle data for
+    the affected token: EMA5/EMA25 ended up computed with zero
+    previous-day warm-up instead of a genuine reset-at-open or a
+    correctly-seeded series.
+
+    Fix: only write to prev_day_cache when the fetch actually returned
+    data. An empty result is treated as "not yet cached" so the NEXT run
+    retries the fetch instead of permanently trusting a failed attempt.
+    """
     token_str = str(token)
 
     if token_str in prev_day_cache:
@@ -143,19 +162,15 @@ def get_candles_with_cache(smart_api, token, prev_day, prev_day_cache, today_sta
     else:
         prev_day_start = dt.datetime.combine(prev_day, MARKET_OPEN)
         prev_candles = ac.fetch_5min_candles(smart_api, token, start_time=prev_day_start)
-        # FIX: only cache a NON-EMPTY result. An empty list here almost
-        # always means the fetch failed (e.g. exhausted all rate-limit
-        # retries) -- a genuinely zero-candle full previous session for a
-        # near-ATM weekly option is effectively impossible. Caching []
-        # unconditionally "poisons" this token for the rest of the day:
-        # every later run sees the key already present and skips
-        # re-fetching entirely, even after the rate limit clears minutes
-        # later -- degrading that leg's EMA warm-up for the whole session.
         if prev_candles:
             prev_day_cache[token_str] = prev_candles
         else:
-            print(f"Previous-day candle fetch for token {token} returned empty -- "
-                  "NOT caching, will retry on a later run.", file=sys.stderr)
+            print(
+                f"[WARN] get_candles_with_cache: prev-day fetch for token {token_str} "
+                f"returned no candles (prev_day={prev_day.isoformat()}) -- NOT caching "
+                "this empty result, will retry on next run.",
+                file=sys.stderr,
+            )
 
     today_candles = ac.fetch_5min_candles(smart_api, token, start_time=today_start)
 
@@ -504,112 +519,22 @@ def is_eod_squareoff_time():
     return now_ist().time() >= EOD_SQUAREOFF
 
 
-def force_eod_exit(smart_api, state, pos):
-    """
-    EOD SAFETY NET (fallback only): used when the normal candle-based exit
-    check couldn't even reach a decision this run -- either
-    resolve_option_token() failed, or the candle fetch failed -- AND it's
-    already past EOD_SQUAREOFF. Without this, an Angel One outage or
-    rate-limit storm landing right at 15:20-15:30 IST means EOD square-off
-    silently never fires, since both manage_spread_exit() and
-    manage_legacy_single_leg_exit() previously just `return`ed on missing
-    data with no fallback.
-
-    Deliberately bypasses BOTH token resolution and candle data -- the
-    only things this needs (symbol(s), qty) are already stored on the
-    position itself in state.json, since they were captured at entry
-    time. This is intentionally a fallback path only, not a replacement:
-    the normal candle-based exit (with real SL/target checks and a
-    proper closing price) is always tried first; this only engages when
-    that path couldn't run at all.
-
-    Price is best-effort ONLY, for the Telegram/Sheets record -- it is
-    NOT required for the order to execute correctly, since
-    webhook.py's place_leg_order() always uses price_type="MKT" and
-    ignores whatever price value is sent. A single non-retrying spot LTP
-    attempt is made (ac.fetch_spot_ltp_once) specifically so this path
-    doesn't itself risk getting stuck in the same rate-limit retries that
-    likely caused the normal path to fail in the first place; on any
-    failure this proceeds with price=None rather than delaying further.
-    """
-    price = None
-    if smart_api is not None:
-        try:
-            price = ac.fetch_spot_ltp_once(smart_api)
-        except Exception as e:
-            print(f"force_eod_exit: spot LTP attempt raised, proceeding "
-                  f"without a price: {e}", file=sys.stderr)
-            price = None
-
-    if pos.get("spread"):
-        sell_leg = pos["sell_leg"]
-        hedge_leg = pos["hedge_leg"]
-        payload = {
-            "action": "EXIT_SPREAD",
-            "reason": "EOD_FORCE",
-            "sell_symbol": sell_leg["symbol"],
-            "hedge_symbol": hedge_leg["symbol"],
-            "qty": pos["qty"],
-            "price": price,
-            "time": now_ist().isoformat(),
-        }
-    else:
-        payload = {
-            "action": "EXIT",
-            "reason": "EOD_FORCE",
-            "symbol": pos["symbol"],
-            "qty": pos["qty"],
-            "price": price,
-            "time": now_ist().isoformat(),
-        }
-
-    resp = send_to_webhook(payload)
-
-    if webhook_confirmed_ok(resp):
-        state["open_position"] = None
-        print(f"EOD FORCE-EXIT confirmed (normal exit path had no data this run) "
-              f"-- position closed. price={price}")
-    else:
-        print(
-            "EOD FORCE-EXIT webhook not confirmed -- leaving open_position in "
-            "state.json so the next run retries. If runs keep failing past "
-            "market close, THIS NEEDS MANUAL ATTENTION -- the position may be "
-            "sitting open overnight with no further automated retry once "
-            "is_market_open_now() goes False.",
-            file=sys.stderr,
-        )
-
-
 def manage_legacy_single_leg_exit(state, pos, instruments, expiry, smart_api, prev_day, prev_day_cache, today_start):
     """
     UNCHANGED dynamic-SL exit logic for single-leg positions opened before
     the pending-signal/spread rework landed (identified by the absence of
-    a "spread" key). Do not change this function's core behaviour -- it
-    exists only so a position opened before this rework gets managed
-    through to its own exit correctly. New positions never take this
-    path; see manage_spread_exit() instead.
-
-    FIX (EOD safety net): previously, if token resolution or candle fetch
-    failed, this function just returned with no fallback -- meaning EOD
-    square-off could silently never fire during an outage. Now falls back
-    to force_eod_exit() specifically when that happens AND it's already
-    past EOD_SQUAREOFF -- see force_eod_exit() docstring. This fallback
-    does not change the SL/target logic itself, only what happens when
-    that logic couldn't run at all this run.
+    a "spread" key). Do not change this function's behaviour -- it exists
+    only so the position already open in state.json as of 2026-07-01
+    (NIFTY07JUL2624050PE) gets managed through to its own exit correctly.
+    New positions never take this path; see manage_spread_exit() instead.
     """
     token_info = ac.resolve_option_token(instruments, expiry, pos["strike"], pos["option_type"])
+    if not token_info:
+        return
 
-    df = None
-    if token_info:
-        candles = get_candles_with_cache(smart_api, token_info["token"], prev_day, prev_day_cache, today_start)
-        df = compute_indicators(candles)
-
+    candles = get_candles_with_cache(smart_api, token_info["token"], prev_day, prev_day_cache, today_start)
+    df = compute_indicators(candles)
     if df is None:
-        if is_eod_squareoff_time():
-            print("Candle data/token unavailable for legacy single-leg position "
-                  "at/after EOD squareoff time -- falling back to force-exit.",
-                  file=sys.stderr)
-            force_eod_exit(smart_api, state, pos)
         return
 
     last = df.iloc[-1]
@@ -639,54 +564,81 @@ def manage_legacy_single_leg_exit(state, pos, instruments, expiry, smart_api, pr
 
 def manage_spread_exit(state, pos, instruments, expiry, smart_api, prev_day, prev_day_cache, today_start):
     """
-    Exit logic for two-leg spread positions opened under the new
-    pending-signal flow. SL/target are the FIXED levels locked at signal
-    time (pos["sl_price"] / pos["target_price"]) -- not re-evaluated every
-    candle the way the legacy dynamic close>VWAP check is. Widening the SL
-    rule itself (VWAP+buffer, VIX filter) is a separate, deliberately
-    deferred change -- this only fixes what price triggers the exit.
+    FIX (OCO bracket moved to webhook.py, 2026-07-03): previously this
+    function decided SL/target itself using only the latest candle's
+    CLOSE (`close > pos["sl_price"]` / `close <= pos["target_price"]`).
+    That let price spike through SL intrabar and close back on the safe
+    side, reporting "no SL hit" even though a real resting SL order at a
+    broker fires the moment price TOUCHES it. Confirmed case (2026-07-03):
+    SL=67.81, price spiked above and closed back under within the same
+    5-min candle -- the old close-only check never fired, leaving the
+    position open with unbounded intrabar risk (Pragnesh's "what if it
+    flies to 99?" scenario).
 
-    Both legs are always closed together in a single EXIT_SPREAD webhook
-    call.
+    This function no longer decides SL vs target at all. It just fetches
+    the candle (unchanged) and hands high/low/close, plus the position's
+    fixed SL/target levels, to webhook.py via the new MANAGE_SPREAD
+    action. webhook.py owns the actual bracket decision -- see
+    check_spread_bracket() there: checks against HIGH/LOW (not close),
+    with an explicit SL-wins tie-break if a single candle's range touches
+    both levels (Pragnesh's call: a same-candle double-touch reads as a
+    pullback, protect capital first).
 
-    FIX (EOD safety net): previously, if token resolution or candle fetch
-    failed, this function just returned with no fallback -- meaning EOD
-    square-off could silently never fire during an outage. Now falls back
-    to force_eod_exit() specifically when that happens AND it's already
-    past EOD_SQUAREOFF -- see force_eod_exit() docstring. This fallback
-    does not change the SL/target logic itself, only what happens when
-    that logic couldn't run at all this run.
+    EOD square-off is kept as a SEPARATE, simpler path on purpose -- it
+    isn't an SL/target bracket decision, just "flatten regardless of
+    price", so it still goes straight through EXIT_SPREAD rather than
+    MANAGE_SPREAD.
+
+    NOTE: this only fixes WHICH price triggers the exit and WHO decides
+    it. It does not yet place a real broker-side SL/target order in
+    LIVE_MODE -- see CHANGELOG for that as a separate, larger piece of
+    work (confirmed real-order entry -> real bracket placement).
     """
     sell_leg = pos["sell_leg"]
     token_info = ac.resolve_option_token(instruments, expiry, sell_leg["strike"], pos["option_type"])
+    if not token_info:
+        return
 
-    df = None
-    if token_info:
-        candles = get_candles_with_cache(smart_api, token_info["token"], prev_day, prev_day_cache, today_start)
-        df = compute_indicators(candles)
-
+    candles = get_candles_with_cache(smart_api, token_info["token"], prev_day, prev_day_cache, today_start)
+    df = compute_indicators(candles)
     if df is None:
-        if is_eod_squareoff_time():
-            print("Candle data/token unavailable for spread position "
-                  "at/after EOD squareoff time -- falling back to force-exit.",
-                  file=sys.stderr)
-            force_eod_exit(smart_api, state, pos)
         return
 
     last = df.iloc[-1]
-    close = float(last["close"])
-    sl_hit = close > pos["sl_price"]
-    target_hit = close <= pos["target_price"]
 
-    if sl_hit or target_hit or is_eod_squareoff_time():
-        reason = "SL" if sl_hit else ("TARGET" if target_hit else "EOD")
+    # DEBUG (temporary): this function no longer decides SL/target itself
+    # (see FIX note above -- that now lives in webhook.py), but it's
+    # still useful to see locally what candle data is being sent up and
+    # what the webhook decided, without needing to cross-reference two
+    # services' logs. Read-only, wrapped so a formatting issue here can
+    # never block a real exit.
+    try:
+        candle_time_str = last["time"].strftime("%H:%M")
+    except Exception:
+        candle_time_str = str(last.get("time"))
+    try:
+        close = float(last["close"])
+        low = float(last["low"])
+        high = float(last["high"])
+        print(f"Checking exit: {sell_leg['symbol']}", file=sys.stderr)
+        print(f"Last candle: {candle_time_str}", file=sys.stderr)
+        print(f"Close = {close:.2f}  Low = {low:.2f}  High = {high:.2f}", file=sys.stderr)
+        print(f"SL = {pos['sl_price']:.2f}  Target = {pos['target_price']:.2f}", file=sys.stderr)
+        print(f"Target touched intra-candle (low <= target) : {low <= pos['target_price']}", file=sys.stderr)
+        print(f"SL touched intra-candle (high >= SL) : {high >= pos['sl_price']}", file=sys.stderr)
+    except Exception as e:
+        print(f"Checking exit: {sell_leg['symbol']}: debug logging failed ({e!r}) -- continuing without it.",
+              file=sys.stderr)
+
+    # ---- EOD square-off: unconditional flatten, not a bracket decision ----
+    if is_eod_squareoff_time():
         resp = send_to_webhook({
             "action": "EXIT_SPREAD",
-            "reason": reason,
+            "reason": "EOD",
             "sell_symbol": sell_leg["symbol"],
             "hedge_symbol": pos["hedge_leg"]["symbol"],
             "qty": pos["qty"],
-            "price": close,
+            "price": float(last["close"]),
             "time": now_ist().isoformat(),
         })
 
@@ -694,10 +646,52 @@ def manage_spread_exit(state, pos, instruments, expiry, smart_api, prev_day, pre
             state["open_position"] = None
         else:
             print(
-                "EXIT_SPREAD webhook not confirmed -- leaving open_position "
+                "EXIT_SPREAD (EOD) webhook not confirmed -- leaving open_position "
                 "in state.json so the next run retries.",
                 file=sys.stderr,
             )
+        return
+
+    # ---- SL/target bracket check -- decision now lives in webhook.py ----
+    resp = send_to_webhook({
+        "action": "MANAGE_SPREAD",
+        "sell_symbol": sell_leg["symbol"],
+        "hedge_symbol": pos["hedge_leg"]["symbol"],
+        "qty": pos["qty"],
+        "candle_high": float(last["high"]),
+        "candle_low": float(last["low"]),
+        "sl_price": pos["sl_price"],
+        "target_price": pos["target_price"],
+        "time": now_ist().isoformat(),
+    })
+
+    if resp is None:
+        print(
+            "MANAGE_SPREAD webhook call failed outright -- leaving open_position "
+            "in state.json so the next run retries.",
+            file=sys.stderr,
+        )
+        return
+
+    try:
+        body = resp.json()
+    except ValueError:
+        body = {}
+
+    if resp.status_code == 200 and body.get("status") == "ok":
+        if body.get("closed"):
+            print(f"Position closed by bracket check: reason={body.get('reason')} "
+                  f"price={body.get('price')}")
+            state["open_position"] = None
+        else:
+            print("Exit = False (still open, per webhook's bracket check)", file=sys.stderr)
+    else:
+        print(
+            f"MANAGE_SPREAD webhook not confirmed (status={resp.status_code}, "
+            f"body={body}) -- leaving open_position in state.json so the next "
+            "run retries.",
+            file=sys.stderr,
+        )
 
 
 def manage_pending_signal(state, instruments, expiry, smart_api, prev_day, prev_day_cache, today_start):
