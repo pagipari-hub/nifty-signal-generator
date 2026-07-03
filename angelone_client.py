@@ -18,6 +18,7 @@ import os
 import sys
 import json
 import time
+import random
 import datetime as dt
 
 import pyotp
@@ -30,13 +31,38 @@ INSTRUMENT_MASTER_URL = (
 )
 INSTRUMENT_MASTER_CACHE = "instrument_master.json"
 
-RATE_LIMIT_RETRY_ATTEMPTS = 3
-RATE_LIMIT_RETRY_DELAY_SECONDS = 3
+# FIX (rate-limit retry rework): the old retry config (3 attempts, flat 3s
+# delay) was tuned as if Angel One only enforced a per-second cap. Their
+# own forum confirms getCandleData also has a per-MINUTE cap (~180/min)
+# on top of the per-second one, and there are widespread reports of
+# "exceeding access rate" firing even under the documented per-second
+# limit -- consistent with the cap being enforced per API key across ALL
+# concurrent sessions, not just the current process. A flat 3s x 3
+# attempts (9s total) can never clear a per-minute window that's already
+# been exhausted by an overlapping run. Switched to exponential backoff
+# with jitter and a much longer ceiling so a retry sequence can actually
+# survive a per-minute cap being hit, not just a per-second blip.
+RATE_LIMIT_RETRY_ATTEMPTS = 4
+RATE_LIMIT_BASE_DELAY_SECONDS = 5
+RATE_LIMIT_MAX_DELAY_SECONDS = 45
+RATE_LIMIT_JITTER_SECONDS = 2
 PRE_CALL_DELAY_SECONDS = 1.5
 
 
-def _call_with_retry(label, func, attempts=RATE_LIMIT_RETRY_ATTEMPTS,
-                      delay=RATE_LIMIT_RETRY_DELAY_SECONDS):
+def _rate_limit_backoff_delay(attempt):
+    """
+    Exponential backoff: 5s, 10s, 20s, 40s... capped at
+    RATE_LIMIT_MAX_DELAY_SECONDS, plus a small random jitter so multiple
+    retrying calls (e.g. across the several tokens fetched per run) don't
+    all retry in lockstep and re-collide on the same rate-limit window.
+    """
+    base = RATE_LIMIT_BASE_DELAY_SECONDS * (2 ** (attempt - 1))
+    capped = min(base, RATE_LIMIT_MAX_DELAY_SECONDS)
+    jitter = random.uniform(0, RATE_LIMIT_JITTER_SECONDS)
+    return capped + jitter
+
+
+def _call_with_retry(label, func, attempts=RATE_LIMIT_RETRY_ATTEMPTS):
     last_err = None
     for attempt in range(1, attempts + 1):
         try:
@@ -45,13 +71,20 @@ def _call_with_retry(label, func, attempts=RATE_LIMIT_RETRY_ATTEMPTS,
             last_err = e
             msg = str(e)
             if "exceeding access rate" in msg.lower() or "access denied" in msg.lower():
-                print(
-                    f"{label}: rate-limited (attempt {attempt}/{attempts}): {msg}",
-                    file=sys.stderr,
-                )
                 if attempt < attempts:
+                    delay = _rate_limit_backoff_delay(attempt)
+                    print(
+                        f"{label}: rate-limited (attempt {attempt}/{attempts}), "
+                        f"backing off {delay:.1f}s: {msg}",
+                        file=sys.stderr,
+                    )
                     time.sleep(delay)
                     continue
+                print(
+                    f"{label}: rate-limited (attempt {attempt}/{attempts}), "
+                    f"giving up: {msg}",
+                    file=sys.stderr,
+                )
             raise
     raise last_err
 
@@ -139,6 +172,15 @@ def resolve_option_token(instruments, expiry_date, strike, option_type):
 
 
 def fetch_5min_candles(smart_api, token, start_time=None, lookback_minutes=180):
+    # DEBUG (temporary -- investigating possible timezone mismatch): `now`
+    # here is dt.datetime.now(), i.e. whatever timezone the process's
+    # system clock is in. GitHub Actions runners default to UTC unless the
+    # workflow explicitly sets TZ=Asia/Kolkata, while Angel One's
+    # getCandleData expects fromdate/todate in IST. If the runner is UTC,
+    # `todate` sent below would be ~5.5 hours behind actual IST "now",
+    # which could silently truncate the candle window during market hours.
+    # Not changing behavior yet -- logging both clocks so this can be
+    # confirmed or ruled out from a live run's output first.
     now = dt.datetime.now()
     start = start_time if start_time is not None else now - dt.timedelta(minutes=lookback_minutes)
 
@@ -149,6 +191,13 @@ def fetch_5min_candles(smart_api, token, start_time=None, lookback_minutes=180):
         "fromdate": start.strftime("%Y-%m-%d %H:%M"),
         "todate": now.strftime("%Y-%m-%d %H:%M"),
     }
+
+    print(
+        f"[DEBUG] fetch_5min_candles token={token} "
+        f"system_now={now.isoformat()} (tzinfo={now.tzinfo}) "
+        f"params.fromdate={params['fromdate']} params.todate={params['todate']}",
+        file=sys.stderr,
+    )
 
     time.sleep(PRE_CALL_DELAY_SECONDS)
 
@@ -176,6 +225,21 @@ def fetch_5min_candles(smart_api, token, start_time=None, lookback_minutes=180):
             "volume": float(row[5]),
         })
 
+    # DEBUG (temporary): what's the actual latest candle Angel One handed
+    # back for this token, vs what we asked for as todate?
+    if candles:
+        print(
+            f"[DEBUG] token={token} latest candle returned: time={candles[-1]['time']} "
+            f"close={candles[-1]['close']} (requested todate={params['todate']})",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            f"[DEBUG] token={token} NO candles returned for range "
+            f"{params['fromdate']} -> {params['todate']}",
+            file=sys.stderr,
+        )
+
     return candles
 
 
@@ -197,31 +261,43 @@ def fetch_spot_ltp(smart_api):
     return float(response["data"]["ltp"])
 
 
-def fetch_spot_ltp_once(smart_api):
-    """
-    Single-attempt, NON-retrying spot LTP fetch -- deliberately bypasses
-    _call_with_retry's exponential backoff (worst case ~90s across 4
-    attempts: 5+10+20+40s plus jitter). Used only by strategy.py's EOD
-    force-exit fallback, where the entire point is to act fast and
-    independently of whatever is already failing (rate limiting, a down
-    endpoint, etc.) rather than risk burning more time on more retries
-    right when a position needs to be closed before market close.
+# FIX (EOD hardening, re-integrated -- this function was dropped when an
+# older draft got pasted back into the project): force_eod_exit() in
+# strategy.py deliberately does NOT go through fetch_5min_candles() or
+# resolve_option_token() -- those are the fragile, multi-call path that
+# EOD square-off (a safety net, not a signal decision) shouldn't depend
+# on. All it needs is SOME price for the Telegram/Sheets log line, since
+# the actual exit order is placed MKT (price_type="MKT" in both
+# place_real_order() and place_real_spread_order() in webhook.py) --
+# execution doesn't depend on this value at all.
+#
+# Kept deliberately lighter-weight than fetch_spot_ltp(): fewer retry
+# attempts, because this runs right at the EOD_SQUAREOFF boundary and
+# must not let a rate-limit retry sequence (which can legitimately take
+# up to ~45s per attempt under the normal retry config) delay a
+# time-critical flatten. If it fails, the caller proceeds with a None
+# price rather than blocking -- a missing log price is cosmetic, a
+# delayed EOD exit is not.
+_EOD_LTP_RETRY_ATTEMPTS = 2
 
-    Returns None on ANY failure. Callers must treat a None price as
-    acceptable -- the actual order execution in webhook.py always uses
-    price_type="MKT" and does not depend on this value; it exists purely
-    for the Telegram/Sheets record.
-    """
+
+def fetch_spot_ltp_once(smart_api):
+    time.sleep(PRE_CALL_DELAY_SECONDS)
+
     try:
-        response = smart_api.ltpData("NSE", "Nifty 50", "99926000")
-    except Exception as e:
-        print(f"fetch_spot_ltp_once: single-attempt fetch failed, proceeding "
-              f"without a price: {e}", file=sys.stderr)
+        response = _call_with_retry(
+            "fetch_spot_ltp_once (EOD)",
+            lambda: smart_api.ltpData("NSE", "Nifty 50", "99926000"),
+            attempts=_EOD_LTP_RETRY_ATTEMPTS,
+        )
+    except DataException as e:
+        print(f"[EOD] Spot LTP fetch failed after {_EOD_LTP_RETRY_ATTEMPTS} attempts "
+              f"-- proceeding with EOD exit anyway, price will be logged as unknown: {e}",
+              file=sys.stderr)
         return None
 
     if not response or not response.get("status"):
+        print(f"[EOD] Spot LTP fetch failed: {response} -- proceeding with EOD exit anyway.",
+              file=sys.stderr)
         return None
-    try:
-        return float(response["data"]["ltp"])
-    except (KeyError, TypeError, ValueError):
-        return None
+    return float(response["data"]["ltp"])
