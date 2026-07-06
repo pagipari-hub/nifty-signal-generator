@@ -4,3 +4,5 @@ logzero
 websocket-client
 requests
 pandas
+gspread
+google-auth
