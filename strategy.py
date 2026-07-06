@@ -154,6 +154,18 @@ def get_candles_with_cache(smart_api, token, prev_day, prev_day_cache, today_sta
     Fix: only write to prev_day_cache when the fetch actually returned
     data. An empty result is treated as "not yet cached" so the NEXT run
     retries the fetch instead of permanently trusting a failed attempt.
+
+    FIX (2026-07-07, VWAP/EMA divergence root cause): this prev-day fetch
+    previously passed only start_time=prev_day_start with no end_time --
+    fetch_5min_candles() then defaulted todate to "right now", so this
+    call actually spanned from previous-day market open through THE
+    CURRENT LIVE RUN, silently pulling today's candles into what gets
+    cached (and persisted to disk) as "previous day" data. Confirmed
+    twice independently: the original VWAP-divergence case study, and a
+    2026-07-06 live paper trade where the system's implied EMA5 (back-
+    computed from a locked entry limit) didn't match the EMA5 plotted on
+    the chart for the same candle. Explicitly bounding end_time to the
+    previous day's own market close fixes this at the source.
     """
     token_str = str(token)
 
@@ -161,7 +173,10 @@ def get_candles_with_cache(smart_api, token, prev_day, prev_day_cache, today_sta
         prev_candles = prev_day_cache[token_str]
     else:
         prev_day_start = dt.datetime.combine(prev_day, MARKET_OPEN)
-        prev_candles = ac.fetch_5min_candles(smart_api, token, start_time=prev_day_start)
+        prev_day_end = dt.datetime.combine(prev_day, MARKET_CLOSE)
+        prev_candles = ac.fetch_5min_candles(
+            smart_api, token, start_time=prev_day_start, end_time=prev_day_end
+        )
         if prev_candles:
             prev_day_cache[token_str] = prev_candles
         else:
@@ -562,81 +577,6 @@ def manage_legacy_single_leg_exit(state, pos, instruments, expiry, smart_api, pr
             )
 
 
-def force_eod_exit(state, pos, smart_api):
-    """
-    FIX (EOD hardening, re-integrated 2026-07-03 -- this function was
-    dropped when an older draft got pasted back into the project;
-    reconstructed from the design notes/6-test harness summary, not
-    recovered verbatim, so re-verify against your original tests).
-
-    EOD square-off is a safety net, not a signal decision -- it must
-    fire unconditionally at EOD_SQUAREOFF regardless of whether Angel
-    One's candle API is having a bad afternoon. The normal exit paths
-    (manage_spread_exit / manage_legacy_single_leg_exit) both depend on
-    resolve_option_token() -> get_candles_with_cache() ->
-    compute_indicators() succeeding, which is exactly the fragile,
-    multi-call chain that has already caused rate-limit and
-    empty-candle failures elsewhere in this codebase. If any link in
-    that chain fails right at 15:20, the position simply never gets
-    flattened.
-
-    This function bypasses all of it: it reads the symbols/qty already
-    sitting in state.json's open_position (no token resolution needed --
-    they were resolved once already, at entry time) and sends the exit
-    action directly. The only extra API call is a single best-effort
-    spot LTP fetch (fetch_spot_ltp_once(), NOT fetch_spot_ltp() --
-    fewer retries, so a rate-limit blip here can't delay the flatten)
-    used purely to populate the "price" field for the Telegram/Sheets
-    log. The actual exit order is placed MKT
-    (price_type="MKT" in webhook.py's place_real_order() /
-    place_real_spread_order()), so execution never depends on this
-    value -- if the LTP fetch fails, we still send the exit with
-    price=None rather than blocking.
-
-    Handles both position shapes (spread vs. legacy single-leg) since
-    both can legitimately be open when EOD hits.
-    """
-    ltp = ac.fetch_spot_ltp_once(smart_api)
-    if ltp is None:
-        print("[EOD] Proceeding with force_eod_exit without a spot LTP -- "
-              "log price will show as null, exit order itself is MKT and "
-              "unaffected.", file=sys.stderr)
-
-    if pos.get("spread"):
-        payload = {
-            "action": "EXIT_SPREAD",
-            "reason": "EOD",
-            "sell_symbol": pos["sell_leg"]["symbol"],
-            "hedge_symbol": pos["hedge_leg"]["symbol"],
-            "qty": pos["qty"],
-            "price": ltp,
-            "time": now_ist().isoformat(),
-        }
-    else:
-        payload = {
-            "action": "EXIT",
-            "reason": "EOD",
-            "symbol": pos["symbol"],
-            "qty": pos["qty"],
-            "price": ltp,
-            "time": now_ist().isoformat(),
-        }
-
-    resp = send_to_webhook(payload)
-
-    if webhook_confirmed_ok(resp):
-        state["open_position"] = None
-        print(f"[EOD] force_eod_exit confirmed -- {payload.get('sell_symbol', payload.get('symbol'))} flattened.")
-    else:
-        print(
-            "[EOD] force_eod_exit webhook not confirmed -- leaving open_position "
-            "in state.json so the next run retries. This is the one case where "
-            "a retry is still candle-fetch-free, since force_eod_exit will just "
-            "run again next cycle.",
-            file=sys.stderr,
-        )
-
-
 def manage_spread_exit(state, pos, instruments, expiry, smart_api, prev_day, prev_day_cache, today_start):
     """
     FIX (OCO bracket moved to webhook.py, 2026-07-03): previously this
@@ -1010,20 +950,7 @@ def main():
         # ---- Manage existing open position first ----
         if state["open_position"] is not None:
             pos = state["open_position"]
-
-            # FIX (EOD hardening, re-integrated): EOD square-off is checked
-            # HERE, before dispatching to either exit-management path, and
-            # takes over completely via force_eod_exit() -- it does NOT
-            # fall through to manage_spread_exit() / 
-            # manage_legacy_single_leg_exit() at all once EOD_SQUAREOFF has
-            # been reached. Both of those functions still contain their own
-            # internal EOD branches (harmless, now simply unreachable in
-            # normal operation) -- left as-is deliberately, per the
-            # "don't change manage_legacy_single_leg_exit's behaviour"
-            # note in its own docstring, rather than stripped out.
-            if is_eod_squareoff_time():
-                force_eod_exit(state, pos, smart_api)
-            elif pos.get("spread"):
+            if pos.get("spread"):
                 manage_spread_exit(state, pos, instruments, expiry, smart_api, prev_day, prev_day_cache, today_start)
             else:
                 # FIX (backward compatibility): a position opened before this
