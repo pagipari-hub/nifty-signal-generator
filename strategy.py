@@ -361,15 +361,65 @@ def compute_indicators(candles):
     return df
 
 
+def _condition_holds(row):
+    """
+    Shared EMA5/EMA25/VWAP condition check for a single candle row. Used
+    by both check_entry_signal() (state-based, "does the setup still
+    hold") and is_fresh_crossover_signal() (transition-based, "did the
+    setup JUST start holding").
+    """
+    return (
+        row["ema5"] < row["vwap"]
+        and row["ema25"] > row["ema5"]
+        and row["ema25"] > row["vwap"]
+    )
+
+
 def check_entry_signal(df):
+    """
+    STATE check: is the EMA5/VWAP/EMA25 condition true on the latest
+    candle, regardless of whether it just started or has held for a
+    while? Deliberately state-based, NOT transition-based -- this is used
+    by manage_pending_signal() to decide whether a resting limit order's
+    setup has been INVALIDATED (see that function's cancellation check).
+    A resting order shouldn't get cancelled just because the condition
+    "isn't fresh" anymore; it should only get cancelled if the condition
+    actually stopped holding. Do NOT use this for scanning brand-new
+    entries -- see is_fresh_crossover_signal() for that.
+    """
     if df is None or len(df) < 2:
         return False
-    last = df.iloc[-1]
-    return (
-        last["ema5"] < last["vwap"]
-        and last["ema25"] > last["ema5"]
-        and last["ema25"] > last["vwap"]
-    )
+    return _condition_holds(df.iloc[-1])
+
+
+def is_fresh_crossover_signal(df):
+    """
+    FIX (2026-07-07, re-entry-on-held-state bug): check_entry_signal()
+    above only checks whether the condition is true RIGHT NOW, not
+    whether it just started being true. Since a resting pending_signal
+    can expire unfilled (5-candle window) while the underlying condition
+    never actually broke down, the OLD scan_for_new_signal() -- which
+    called check_entry_signal() -- would immediately re-fire a brand new
+    pending_signal on the very next scan, even though there was no new
+    crossover at all, just the same still-held state. Confirmed on live
+    paper data twice: the whipsaw SL day case study, and a 2026-07-06
+    trade where a 9:35 crossover's pending signal expired unfilled and a
+    "new" signal re-fired at 10:00 purely because EMA5 had never gone
+    back above VWAP in between -- the debug log's own line
+    ("prev candle EMA5 < VWAP : True -> state already held") confirmed
+    this at the time.
+
+    This requires the PREVIOUS candle to NOT satisfy the condition and
+    the CURRENT candle to satisfy it -- i.e. an actual transition, not
+    just a persisting state. Used only by scan_for_new_signal() for
+    brand-new entries; manage_pending_signal()'s cancellation check
+    correctly keeps using the state-based check_entry_signal() above.
+    """
+    if df is None or len(df) < 2:
+        return False
+    current = _condition_holds(df.iloc[-1])
+    previous = _condition_holds(df.iloc[-2])
+    return current and not previous
 
 
 def log_signal_debug(symbol, df):
@@ -815,6 +865,16 @@ def scan_for_new_signal(state, leg_pairs, instruments, expiry, smart_api, prev_d
     crossover. On a match, locks a resting pending_signal (see
     compute_pending_signal()) instead of entering immediately -- the fill
     itself happens later in manage_pending_signal() on a subsequent run.
+
+    FIX (2026-07-07): now uses is_fresh_crossover_signal() instead of
+    check_entry_signal() -- see that function's docstring for the full
+    root-cause writeup. In short: check_entry_signal() is state-based
+    ("is the condition true now"), which let this function re-fire a
+    brand new pending_signal on the very next scan after a prior one
+    expired unfilled, even with no actual new crossover -- just the same
+    still-held EMA5<VWAP state. is_fresh_crossover_signal() additionally
+    requires the previous candle to NOT have satisfied the condition, so
+    a genuinely fresh cross is required for a new signal to fire.
     """
     for leg in leg_pairs:
         sell_token_info = ac.resolve_option_token(instruments, expiry, leg["sell_strike"], leg["option_type"])
@@ -831,7 +891,7 @@ def scan_for_new_signal(state, leg_pairs, instruments, expiry, smart_api, prev_d
         # clear which specific condition is blocking a signal on each side.
         log_signal_debug(sell_token_info["symbol"], df)
 
-        if check_entry_signal(df):
+        if is_fresh_crossover_signal(df):
             hedge_token_info = ac.resolve_option_token(instruments, expiry, leg["hedge_strike"], leg["option_type"])
             if not hedge_token_info:
                 print(f"Signal fired on {sell_token_info['symbol']} but hedge strike "
