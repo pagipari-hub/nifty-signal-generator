@@ -171,7 +171,31 @@ def resolve_option_token(instruments, expiry_date, strike, option_type):
     return None
 
 
-def fetch_5min_candles(smart_api, token, start_time=None, lookback_minutes=180):
+def fetch_5min_candles(smart_api, token, start_time=None, end_time=None, lookback_minutes=180):
+    """
+    FIX (2026-07-07, VWAP/EMA divergence root cause): previously `todate`
+    always defaulted to dt.datetime.now() -- the moment THIS call runs --
+    with no way to cap it. That's fine for a normal "today so far" fetch,
+    but get_candles_with_cache()'s prev-day warm-up fetch calls this with
+    only start_time=prev_day_start and no upper bound, so `todate` ended
+    up being "right now" every time -- meaning that "prev-day" fetch
+    actually spanned from previous-day market open all the way through
+    THE CURRENT LIVE RUN, silently pulling today's candles into what got
+    cached and persisted as prev_day_candles.json. Later runs then merged
+    that already-contaminated prev-day series with a fresh today-fetch,
+    and any dedup mismatch on the "time" string was enough to distort
+    EMA5/EMA25 -- confirmed independently twice: (1) the original VWAP-
+    divergence case study, and (2) a live paper-trading case on
+    2026-07-06 where the system's implied EMA5 (from a locked entry
+    limit) didn't match the EMA5 visibly plotted on the chart for the
+    same candle.
+
+    Adding an optional end_time parameter (defaults to now() for
+    backward compatibility -- normal "up to this moment" fetches are
+    unaffected) lets prev-day fetches be explicitly bounded to the
+    previous day's own close, so they can never again bleed into the
+    current run's live candles.
+    """
     # DEBUG (temporary -- investigating possible timezone mismatch): `now`
     # here is dt.datetime.now(), i.e. whatever timezone the process's
     # system clock is in. GitHub Actions runners default to UTC unless the
@@ -182,14 +206,15 @@ def fetch_5min_candles(smart_api, token, start_time=None, lookback_minutes=180):
     # Not changing behavior yet -- logging both clocks so this can be
     # confirmed or ruled out from a live run's output first.
     now = dt.datetime.now()
-    start = start_time if start_time is not None else now - dt.timedelta(minutes=lookback_minutes)
+    end = end_time if end_time is not None else now
+    start = start_time if start_time is not None else end - dt.timedelta(minutes=lookback_minutes)
 
     params = {
         "exchange": "NFO",
         "symboltoken": token,
         "interval": "FIVE_MINUTE",
         "fromdate": start.strftime("%Y-%m-%d %H:%M"),
-        "todate": now.strftime("%Y-%m-%d %H:%M"),
+        "todate": end.strftime("%Y-%m-%d %H:%M"),
     }
 
     print(
@@ -257,47 +282,5 @@ def fetch_spot_ltp(smart_api):
 
     if not response or not response.get("status"):
         print(f"Spot LTP fetch failed: {response}", file=sys.stderr)
-        return None
-    return float(response["data"]["ltp"])
-
-
-# FIX (EOD hardening, re-integrated -- this function was dropped when an
-# older draft got pasted back into the project): force_eod_exit() in
-# strategy.py deliberately does NOT go through fetch_5min_candles() or
-# resolve_option_token() -- those are the fragile, multi-call path that
-# EOD square-off (a safety net, not a signal decision) shouldn't depend
-# on. All it needs is SOME price for the Telegram/Sheets log line, since
-# the actual exit order is placed MKT (price_type="MKT" in both
-# place_real_order() and place_real_spread_order() in webhook.py) --
-# execution doesn't depend on this value at all.
-#
-# Kept deliberately lighter-weight than fetch_spot_ltp(): fewer retry
-# attempts, because this runs right at the EOD_SQUAREOFF boundary and
-# must not let a rate-limit retry sequence (which can legitimately take
-# up to ~45s per attempt under the normal retry config) delay a
-# time-critical flatten. If it fails, the caller proceeds with a None
-# price rather than blocking -- a missing log price is cosmetic, a
-# delayed EOD exit is not.
-_EOD_LTP_RETRY_ATTEMPTS = 2
-
-
-def fetch_spot_ltp_once(smart_api):
-    time.sleep(PRE_CALL_DELAY_SECONDS)
-
-    try:
-        response = _call_with_retry(
-            "fetch_spot_ltp_once (EOD)",
-            lambda: smart_api.ltpData("NSE", "Nifty 50", "99926000"),
-            attempts=_EOD_LTP_RETRY_ATTEMPTS,
-        )
-    except DataException as e:
-        print(f"[EOD] Spot LTP fetch failed after {_EOD_LTP_RETRY_ATTEMPTS} attempts "
-              f"-- proceeding with EOD exit anyway, price will be logged as unknown: {e}",
-              file=sys.stderr)
-        return None
-
-    if not response or not response.get("status"):
-        print(f"[EOD] Spot LTP fetch failed: {response} -- proceeding with EOD exit anyway.",
-              file=sys.stderr)
         return None
     return float(response["data"]["ltp"])
