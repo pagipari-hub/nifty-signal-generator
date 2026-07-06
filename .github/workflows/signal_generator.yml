@@ -110,6 +110,22 @@ jobs:
           # Now: a push failure after we DID commit something is a real
           # problem (most likely a remote conflict) and fails the job loudly.
           # A push failure when we committed nothing is a true no-op.
+          # FIX (2026-07-07): the concurrency: block above only serializes
+          # overlapping runs of THIS workflow -- it has no awareness of a
+          # manual `git push` (e.g. deploying a code fix mid-market-hours,
+          # as happened today) landing on main in between this job's
+          # checkout and its own push. That's a non-fast-forward rejection,
+          # not a real content conflict, since a manual code push touches
+          # strategy.py/webhook.py/etc. and this job only ever touches
+          # state.json/prev_day_candles.json/candle_history/. A single
+          # `git pull --rebase` right before push absorbs that case
+          # automatically with no manual conflict resolution needed, so a
+          # same-day code deploy doesn't fail every subsequent scheduled
+          # run until someone notices and pulls by hand.
+          if [ "$COMMITTED" = "true" ]; then
+            git pull --rebase origin main || echo "::warning::git pull --rebase failed -- will attempt push anyway, may still fail below."
+          fi
+
           if ! git push; then
             if [ "$COMMITTED" = "true" ]; then
               echo "::error::git push failed after committing state.json changes -- state may be out of sync. Likely a remote conflict (e.g. overlapping runs); pull and inspect state.json manually."
