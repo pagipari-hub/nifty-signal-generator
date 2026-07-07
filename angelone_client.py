@@ -171,31 +171,7 @@ def resolve_option_token(instruments, expiry_date, strike, option_type):
     return None
 
 
-def fetch_5min_candles(smart_api, token, start_time=None, end_time=None, lookback_minutes=180):
-    """
-    FIX (2026-07-07, VWAP/EMA divergence root cause): previously `todate`
-    always defaulted to dt.datetime.now() -- the moment THIS call runs --
-    with no way to cap it. That's fine for a normal "today so far" fetch,
-    but get_candles_with_cache()'s prev-day warm-up fetch calls this with
-    only start_time=prev_day_start and no upper bound, so `todate` ended
-    up being "right now" every time -- meaning that "prev-day" fetch
-    actually spanned from previous-day market open all the way through
-    THE CURRENT LIVE RUN, silently pulling today's candles into what got
-    cached and persisted as prev_day_candles.json. Later runs then merged
-    that already-contaminated prev-day series with a fresh today-fetch,
-    and any dedup mismatch on the "time" string was enough to distort
-    EMA5/EMA25 -- confirmed independently twice: (1) the original VWAP-
-    divergence case study, and (2) a live paper-trading case on
-    2026-07-06 where the system's implied EMA5 (from a locked entry
-    limit) didn't match the EMA5 visibly plotted on the chart for the
-    same candle.
-
-    Adding an optional end_time parameter (defaults to now() for
-    backward compatibility -- normal "up to this moment" fetches are
-    unaffected) lets prev-day fetches be explicitly bounded to the
-    previous day's own close, so they can never again bleed into the
-    current run's live candles.
-    """
+def fetch_5min_candles(smart_api, token, start_time=None, lookback_minutes=180):
     # DEBUG (temporary -- investigating possible timezone mismatch): `now`
     # here is dt.datetime.now(), i.e. whatever timezone the process's
     # system clock is in. GitHub Actions runners default to UTC unless the
@@ -206,15 +182,14 @@ def fetch_5min_candles(smart_api, token, start_time=None, end_time=None, lookbac
     # Not changing behavior yet -- logging both clocks so this can be
     # confirmed or ruled out from a live run's output first.
     now = dt.datetime.now()
-    end = end_time if end_time is not None else now
-    start = start_time if start_time is not None else end - dt.timedelta(minutes=lookback_minutes)
+    start = start_time if start_time is not None else now - dt.timedelta(minutes=lookback_minutes)
 
     params = {
         "exchange": "NFO",
         "symboltoken": token,
         "interval": "FIVE_MINUTE",
         "fromdate": start.strftime("%Y-%m-%d %H:%M"),
-        "todate": end.strftime("%Y-%m-%d %H:%M"),
+        "todate": now.strftime("%Y-%m-%d %H:%M"),
     }
 
     print(
@@ -282,5 +257,37 @@ def fetch_spot_ltp(smart_api):
 
     if not response or not response.get("status"):
         print(f"Spot LTP fetch failed: {response}", file=sys.stderr)
+        return None
+    return float(response["data"]["ltp"])
+
+
+def fetch_option_ltp(smart_api, tradingsymbol, token):
+    """
+    NEW (P&L tracking, 2026-07-06): a single lightweight LTP call for an
+    OPTION token, used only to capture the hedge leg's actual price at
+    entry and exit -- NOT part of the 5-min candle polling loop. This is
+    deliberately a single ltpData() call, not a getCandleData() call: the
+    hedge leg's price only needs to be captured twice per trade (once at
+    entry fill, once at exit), so this is a much smaller addition to
+    Angel One rate-limit exposure than adding a second candle-fetch
+    target to every 5-min run would be.
+
+    Uses the same retry/backoff wrapper as every other Angel One call
+    here, since ltpData() is subject to the same rate limits as
+    getCandleData().
+    """
+    time.sleep(PRE_CALL_DELAY_SECONDS)
+
+    try:
+        response = _call_with_retry(
+            f"fetch_option_ltp[{tradingsymbol}]",
+            lambda: smart_api.ltpData("NFO", tradingsymbol, str(token)),
+        )
+    except DataException as e:
+        print(f"Option LTP fetch failed for {tradingsymbol}: {e}", file=sys.stderr)
+        return None
+
+    if not response or not response.get("status"):
+        print(f"Option LTP fetch failed for {tradingsymbol}: {response}", file=sys.stderr)
         return None
     return float(response["data"]["ltp"])
