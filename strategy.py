@@ -697,6 +697,18 @@ def manage_spread_exit(state, pos, instruments, expiry, smart_api, prev_day, pre
 
     # ---- EOD square-off: unconditional flatten, not a bracket decision ----
     if is_eod_squareoff_time():
+        # NEW (P&L tracking, 2026-07-06): capture hedge leg's current
+        # price at EOD exit, same single-LTP-call approach as at entry.
+        # Never blocks the exit itself -- if this fetch fails, exit still
+        # proceeds and hedge_exit_price is simply logged as None.
+        hedge_exit_price = ac.fetch_option_ltp(
+            smart_api, pos["hedge_leg"]["symbol"], pos["hedge_leg"]["token"]
+        )
+        if hedge_exit_price is None:
+            print(f"Could not fetch hedge leg LTP for {pos['hedge_leg']['symbol']} at EOD exit -- "
+                  "hedge_exit_price will be logged as null; P&L for this trade will be incomplete.",
+                  file=sys.stderr)
+
         resp = send_to_webhook({
             "action": "EXIT_SPREAD",
             "reason": "EOD",
@@ -704,6 +716,9 @@ def manage_spread_exit(state, pos, instruments, expiry, smart_api, prev_day, pre
             "hedge_symbol": pos["hedge_leg"]["symbol"],
             "qty": pos["qty"],
             "price": float(last["close"]),
+            "hedge_exit_price": hedge_exit_price,
+            "entry_price": pos["entry_price"],
+            "hedge_entry_price": pos.get("hedge_entry_price"),
             "time": now_ist().isoformat(),
         })
 
@@ -718,15 +733,59 @@ def manage_spread_exit(state, pos, instruments, expiry, smart_api, prev_day, pre
         return
 
     # ---- SL/target bracket check -- decision now lives in webhook.py ----
+    # FIX (2026-07-06): the hedge-price fetch below used to run
+    # UNCONDITIONALLY on every run a position is open -- including every
+    # "still open, nothing happened" run, which is most of them. That
+    # added an extra API call (plus PRE_CALL_DELAY_SECONDS) BEFORE the
+    # webhook call on every single run, including the one run that
+    # actually matters most: the run where SL/target just got hit,
+    # where the webhook needs to be reached as fast as possible, not
+    # slower. It also added unnecessary rate-limit exposure on every
+    # idle run for zero benefit on those runs.
+    #
+    # Fix: a lightweight LOCAL pre-check, mirroring webhook.py's
+    # check_spread_bracket() (same HIGH/LOW touch check, same SL-wins
+    # tie-break), used ONLY to decide whether it's worth fetching the
+    # hedge price this run. This never overrides or duplicates the
+    # actual decision -- webhook.py's check_spread_bracket() remains the
+    # single authoritative source of truth for whether the position
+    # actually closes. Worst case if this local mirror ever drifts out
+    # of sync with webhook.py's real logic: hedge_current_price is
+    # occasionally None on an actual close (P&L logged as incomplete for
+    # that one trade, exit itself unaffected) or fetched once
+    # unnecessarily on a run that turns out not to close -- neither
+    # case blocks or delays the real exit decision, which is why the
+    # webhook call itself is now issued immediately, before this fetch,
+    # rather than after it.
+    candle_high = float(last["high"])
+    candle_low = float(last["low"])
+    sl_price = pos["sl_price"]
+    target_price = pos["target_price"]
+    bracket_likely_hit = (candle_high >= sl_price) or (candle_low <= target_price)
+
+    hedge_current_price = None
+    if bracket_likely_hit:
+        hedge_current_price = ac.fetch_option_ltp(
+            smart_api, pos["hedge_leg"]["symbol"], pos["hedge_leg"]["token"]
+        )
+        if hedge_current_price is None:
+            print(f"Bracket looks hit (local pre-check) but hedge leg LTP fetch failed for "
+                  f"{pos['hedge_leg']['symbol']} -- proceeding with the exit regardless; "
+                  "P&L for this trade will be logged as incomplete.",
+                  file=sys.stderr)
+
     resp = send_to_webhook({
         "action": "MANAGE_SPREAD",
         "sell_symbol": sell_leg["symbol"],
         "hedge_symbol": pos["hedge_leg"]["symbol"],
         "qty": pos["qty"],
-        "candle_high": float(last["high"]),
-        "candle_low": float(last["low"]),
-        "sl_price": pos["sl_price"],
-        "target_price": pos["target_price"],
+        "candle_high": candle_high,
+        "candle_low": candle_low,
+        "sl_price": sl_price,
+        "target_price": target_price,
+        "hedge_current_price": hedge_current_price,
+        "entry_price": pos["entry_price"],
+        "hedge_entry_price": pos.get("hedge_entry_price"),
         "time": now_ist().isoformat(),
     })
 
@@ -803,6 +862,7 @@ def manage_pending_signal(state, instruments, expiry, smart_api, prev_day, prev_
             "hedge_symbol": hedge_token_info["symbol"],
             "qty": pending["qty"],
             "entry_price": pending["entry_limit"],
+            "hedge_entry_price": pending.get("hedge_entry_price"),
             "sl_price": pending["sl_price"],
             "target_price": pending["target_price"],
             "time": now_ist().isoformat(),
@@ -824,6 +884,7 @@ def manage_pending_signal(state, instruments, expiry, smart_api, prev_day, prev_
                 },
                 "qty": pending["qty"],
                 "entry_price": pending["entry_limit"],
+                "hedge_entry_price": pending.get("hedge_entry_price"),
                 "sl_price": pending["sl_price"],
                 "target_price": pending["target_price"],
                 "entry_time": now_ist().isoformat(),
@@ -899,6 +960,22 @@ def scan_for_new_signal(state, leg_pairs, instruments, expiry, smart_api, prev_d
                       file=sys.stderr)
                 continue
 
+            # NEW (P&L tracking, 2026-07-06): capture the hedge leg's
+            # current price at the moment the signal fires, so real
+            # two-leg P&L can be computed later. This is a SEPARATE,
+            # single LTP call -- not a candle fetch -- so it does not add
+            # a second polling target to the 5-min loop. If this fetch
+            # fails for any reason, the hedge entry price is simply
+            # logged as None rather than blocking the signal -- P&L
+            # tracking must never be able to block a real trade signal.
+            hedge_entry_price = ac.fetch_option_ltp(
+                smart_api, hedge_token_info["symbol"], hedge_token_info["token"]
+            )
+            if hedge_entry_price is None:
+                print(f"Could not fetch hedge leg LTP for {hedge_token_info['symbol']} at signal time -- "
+                      "hedge_entry_price will be logged as null; P&L for this trade will be incomplete.",
+                      file=sys.stderr)
+
             trigger_candle = df.iloc[-1].to_dict()
             qty = sell_token_info["lot_size"]
 
@@ -906,6 +983,7 @@ def scan_for_new_signal(state, leg_pairs, instruments, expiry, smart_api, prev_d
             hedge_leg_info = {**hedge_token_info, "strike": leg["hedge_strike"], "option_type": leg["option_type"]}
 
             state["pending_signal"] = compute_pending_signal(trigger_candle, sell_leg_info, hedge_leg_info, qty)
+            state["pending_signal"]["hedge_entry_price"] = hedge_entry_price
             p = state["pending_signal"]
             print(f"PENDING SIGNAL: SELL {p['sell_symbol']} resting limit @ {p['entry_limit']:.2f} "
                   f"(SL={p['sl_price']:.2f}, target={p['target_price']:.2f})")
