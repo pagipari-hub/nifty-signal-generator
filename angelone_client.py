@@ -284,3 +284,39 @@ def fetch_spot_ltp(smart_api):
         print(f"Spot LTP fetch failed: {response}", file=sys.stderr)
         return None
     return float(response["data"]["ltp"])
+
+
+def fetch_option_ltp(smart_api, symbol, token):
+    """
+    NEW (P&L tracking, 2026-07-06): fetches the last-traded price for a
+    single NFO option leg (used for the hedge leg's entry/exit price,
+    since the hedge is never itself the leg whose candles are polled
+    every run). Mirrors fetch_spot_ltp()'s call pattern -- same
+    pre-call delay, same retry/backoff via _call_with_retry(), same
+    "return None on any failure rather than raise" contract -- but hits
+    the NFO exchange with the option's own tradingsymbol/token instead
+    of the hardcoded NSE "Nifty 50" spot token.
+
+    Callers (scan_for_new_signal(), manage_spread_exit()) already treat
+    a None return as "log it and continue without blocking the real
+    signal/exit" -- this function preserves that contract rather than
+    raising, so a single failed LTP fetch can never take down a run
+    that's managing a live position.
+    """
+    time.sleep(PRE_CALL_DELAY_SECONDS)
+
+    try:
+        response = _call_with_retry(
+            "fetch_option_ltp",
+            lambda: smart_api.ltpData("NFO", symbol, str(token)),
+        )
+    except DataException as e:
+        print(f"Option LTP fetch failed for {symbol} (token={token}) after retries: {e}",
+              file=sys.stderr)
+        return None
+
+    if not response or not response.get("status"):
+        print(f"Option LTP fetch failed for {symbol} (token={token}): {response}",
+              file=sys.stderr)
+        return None
+    return float(response["data"]["ltp"])
