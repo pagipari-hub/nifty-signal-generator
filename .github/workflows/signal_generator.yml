@@ -67,7 +67,7 @@ jobs:
           ANGEL_API_KEY: ${{ secrets.ANGEL_API_KEY }}
           WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
           WEBHOOK_SHARED_SECRET: ${{ secrets.WEBHOOK_SHARED_SECRET }}
-        run: python strategy.py
+        run: python main.py
 
       # FIX (alerting): previously a crashed run was silent -- the only way
       # to find out was manually opening the Actions tab. This fires ONLY
