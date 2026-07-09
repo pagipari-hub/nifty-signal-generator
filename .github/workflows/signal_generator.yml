@@ -84,35 +84,68 @@ jobs:
             COMMITTED=true
           fi
 
-          # FIX (1.8): the old `git push || echo "Nothing to push"` swallowed
-          # ALL push failures identically, including real conflicts (e.g. two
-          # overlapping runs both committing). A genuine state-sync failure
-          # would print a harmless-looking message and the job would still go
-          # green -- no signal in the Actions UI that anything was wrong.
-          # Now: a push failure after we DID commit something is a real
-          # problem (most likely a remote conflict) and fails the job loudly.
-          # A push failure when we committed nothing is a true no-op.
-          # FIX (2026-07-07): the concurrency: block above only serializes
-          # overlapping runs of THIS workflow -- it has no awareness of a
-          # manual `git push` (e.g. deploying a code fix mid-market-hours,
-          # as happened today) landing on main in between this job's
-          # checkout and its own push. That's a non-fast-forward rejection,
-          # not a real content conflict, since a manual code push touches
-          # strategy.py/webhook.py/etc. and this job only ever touches
-          # state.json/prev_day_candles.json/candle_history/. A single
-          # `git pull --rebase` right before push absorbs that case
-          # automatically with no manual conflict resolution needed, so a
-          # same-day code deploy doesn't fail every subsequent scheduled
-          # run until someone notices and pulls by hand.
+          # FIX (2026-07-09, retry-loop -- confirmed data loss, not just a
+          # cosmetic push failure): today produced two separate HEARTBEAT
+          # webhook calls on the same trading day. Root cause: the webhook
+          # call in send_heartbeat_if_needed() is a real, unconditional,
+          # already-confirmed action -- but the state.json write that's
+          # supposed to prevent it firing again only happens AFTERWARD, and
+          # can silently fail to reach origin (see the CONFLICT traces from
+          # runs today -- a run at the concurrency-queue hand-off boundary
+          # races another run's own push). When that happens, the NEXT run
+          # checks out the same stale state.json and repeats whatever
+          # decision the lost run made. For a heartbeat this is just a
+          # duplicate ping; for a freshly-computed pending_signal (the
+          # ONE candle where is_fresh_crossover_signal() is True) it would
+          # be silently unrecoverable -- by the next run, the transition
+          # candle has already passed, and the crossover can never be
+          # detected as "fresh" again. This is a real correctness gap, not
+          # just an alerting gap.
+          #
+          # Fix: a single pull-rebase-push is replaced with a bounded retry
+          # loop. Most of today's races were resolved by the very next
+          # fetch a few seconds later (evidenced by 713-718 all succeeding
+          # immediately after 712 failed) -- so retrying here, inside the
+          # SAME job, catches the common transient case automatically
+          # instead of requiring a whole extra 5-minute cron cycle (or,
+          # worse, silently losing the state that triggered the retry in
+          # the first place). A conflicting rebase is explicitly aborted
+          # before each retry so a failed attempt can never leave the repo
+          # in a broken mid-rebase state that blocks the next attempt.
+          # Backoff is kept short (attempt * 3s, max 4 attempts) to stay
+          # comfortably inside the job's 4-minute timeout even in the
+          # worst case. If all attempts are exhausted, this still fails
+          # loudly exactly as before -- retrying reduces HOW OFTEN this
+          # happens, it doesn't claim to make it impossible.
           if [ "$COMMITTED" = "true" ]; then
-            git pull --rebase origin main || echo "::warning::git pull --rebase failed -- will attempt push anyway, may still fail below."
-          fi
+            MAX_ATTEMPTS=4
+            PUSH_OK=false
+            for attempt in $(seq 1 $MAX_ATTEMPTS); do
+              if [ "$attempt" -gt 1 ]; then
+                DELAY=$((attempt * 3))
+                echo "Retry $attempt/$MAX_ATTEMPTS: waiting ${DELAY}s before re-fetching."
+                sleep "$DELAY"
+              fi
 
-          if ! git push; then
-            if [ "$COMMITTED" = "true" ]; then
-              echo "::error::git push failed after committing state.json changes -- state may be out of sync. Likely a remote conflict (e.g. overlapping runs); pull and inspect state.json manually."
+              if ! git pull --rebase origin main; then
+                echo "::warning::attempt $attempt/$MAX_ATTEMPTS: git pull --rebase failed -- aborting rebase and retrying from a fresh fetch."
+                git rebase --abort 2>/dev/null || true
+                continue
+              fi
+
+              if git push; then
+                PUSH_OK=true
+                break
+              fi
+
+              echo "::warning::attempt $attempt/$MAX_ATTEMPTS: git push rejected even after a clean rebase -- remote moved again, retrying."
+            done
+
+            if [ "$PUSH_OK" = "false" ]; then
+              echo "::error::git push failed after $MAX_ATTEMPTS attempts -- state may be out of sync. Likely a persistent remote conflict; pull and inspect state.json manually."
               exit 1
             fi
+          else
             echo "Nothing to push."
           fi
 
@@ -121,9 +154,9 @@ jobs:
       # condition only looks at steps BEFORE it in the job -- so it caught a
       # crashed main.py, but the "Commit updated state back to repo" step
       # runs AFTER it, meaning a git push/rebase failure there (exactly the
-      # "state may be out of sync" case this repo has hit more than once --
-      # e.g. two runs racing right at the concurrency-queue hand-off
-      # boundary) fired zero alert. That failure mode is arguably the more
+      # "state may be out of sync" case this repo has hit multiple times --
+      # including a confirmed case of real data loss, see the FIX note
+      # above) fired zero alert. That failure mode is arguably the more
       # important one to know about immediately, since it means state.json
       # on GitHub may not reflect what this run actually did.
       #
@@ -140,7 +173,7 @@ jobs:
           if [ "${{ steps.run_strategy.outcome }}" = "failure" ]; then
             REASON="main.py crashed during signal generation"
           elif [ "${{ steps.commit_state.outcome }}" = "failure" ]; then
-            REASON="git push/rebase failed while committing state.json -- state may be out of sync, inspect manually"
+            REASON="git push/rebase failed after retries while committing state.json -- state may be out of sync, inspect manually"
           else
             REASON="unknown step failed"
           fi
