@@ -69,26 +69,8 @@ jobs:
           WEBHOOK_SHARED_SECRET: ${{ secrets.WEBHOOK_SHARED_SECRET }}
         run: python main.py
 
-      # FIX (alerting): previously a crashed run was silent -- the only way
-      # to find out was manually opening the Actions tab. This fires ONLY
-      # when the step above failed (`if: failure()`), pinging the same
-      # Telegram bot already used for trade alerts so a crash is never
-      # missed during market hours. Requires TELEGRAM_BOT_TOKEN and
-      # TELEGRAM_CHAT_ID to be added as repo secrets (Settings > Secrets
-      # and variables > Actions) -- they currently only exist on Render.
-      - name: Alert on failure
-        if: failure()
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: |
-          MSG="⚠️ NIFTY signal-generator run FAILED at $(date '+%Y-%m-%d %H:%M:%S %Z'). Check GitHub Actions logs: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-            -d chat_id="${TELEGRAM_CHAT_ID}" \
-            -d text="$MSG" \
-            || echo "Failed to send Telegram alert (non-fatal, won't block the job)."
-
       - name: Commit updated state back to repo
+        id: commit_state
         run: |
           git config user.name "signal-bot"
           git config user.email "actions@github.com"
@@ -133,3 +115,37 @@ jobs:
             fi
             echo "Nothing to push."
           fi
+
+      # FIX (alerting gap, 2026-07-09): the original "Alert on failure" step
+      # sat right after "Run signal generation", with `if: failure()`. That
+      # condition only looks at steps BEFORE it in the job -- so it caught a
+      # crashed main.py, but the "Commit updated state back to repo" step
+      # runs AFTER it, meaning a git push/rebase failure there (exactly the
+      # "state may be out of sync" case this repo has hit more than once --
+      # e.g. two runs racing right at the concurrency-queue hand-off
+      # boundary) fired zero alert. That failure mode is arguably the more
+      # important one to know about immediately, since it means state.json
+      # on GitHub may not reflect what this run actually did.
+      #
+      # Fix: move the alert to be the LAST step in the job (if: failure()
+      # then correctly covers failures from EITHER step), and identify
+      # which step actually failed in the message so it's clear at a
+      # glance whether this was a script crash or a state-sync problem.
+      - name: Alert on failure
+        if: failure()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          if [ "${{ steps.run_strategy.outcome }}" = "failure" ]; then
+            REASON="main.py crashed during signal generation"
+          elif [ "${{ steps.commit_state.outcome }}" = "failure" ]; then
+            REASON="git push/rebase failed while committing state.json -- state may be out of sync, inspect manually"
+          else
+            REASON="unknown step failed"
+          fi
+          MSG="⚠️ NIFTY signal-generator run FAILED at $(date '+%Y-%m-%d %H:%M:%S %Z'). Reason: ${REASON}. Check GitHub Actions logs: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d chat_id="${TELEGRAM_CHAT_ID}" \
+            -d text="$MSG" \
+            || echo "Failed to send Telegram alert (non-fatal, won't block the job)."
