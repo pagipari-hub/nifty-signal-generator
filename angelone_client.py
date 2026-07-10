@@ -48,6 +48,28 @@ RATE_LIMIT_MAX_DELAY_SECONDS = 45
 RATE_LIMIT_JITTER_SECONDS = 2
 PRE_CALL_DELAY_SECONDS = 1.5
 
+# FIX (2026-07-10, session-per-run root cause): this file previously had
+# no concept of session persistence at all -- every run called login()
+# below, which performs a full TOTP-based generateSession(). Angel One's
+# own docs state a session stays active until 12 midnight unless
+# explicitly logged out, and the SDK exposes a lightweight
+# generateToken(refresh_token) renewal (no TOTP required) for exactly
+# this case -- distinct from, and much lighter than, generateSession().
+# Repeatedly hitting generateSession() every 5 minutes, all day, is a
+# strong suspect for the "exceeding access rate" failures that were
+# landing consistently on the FIRST data call right after a fresh login
+# (2026-07-10 case study: 09:35 and 09:45 runs, CE leg fetch failed
+# outright both times immediately post-login, while later calls in the
+# same run succeeded).
+#
+# SESSION_CACHE_FILE is deliberately NOT committed to git (unlike
+# state.json) -- it must only ever be restored/saved via the GitHub
+# Actions cache (see signal_generator.yml), the same mechanism already
+# used for INSTRUMENT_MASTER_CACHE. Putting a live refresh token into
+# state.json would bake a real credential into the repo's permanent git
+# history on every commit; the Actions cache has no such permanence.
+SESSION_CACHE_FILE = "angel_session.json"
+
 
 def _rate_limit_backoff_delay(attempt):
     """
@@ -90,6 +112,12 @@ def _call_with_retry(label, func, attempts=RATE_LIMIT_RETRY_ATTEMPTS):
 
 
 def login():
+    """
+    UNCHANGED -- full TOTP-based login, called on every invocation. Kept
+    exactly as-is for backward compatibility / reference. New code should
+    call login_with_cache() instead (see below), which only falls back to
+    this full flow when there's no valid cached session for today.
+    """
     client_code = os.environ["ANGEL_CLIENT_CODE"]
     password = os.environ["ANGEL_PASSWORD"]
     totp_secret = os.environ["ANGEL_TOTP_SECRET"]
@@ -105,6 +133,86 @@ def login():
         sys.exit(1)
 
     print("Angel One login OK.")
+    return smart_api
+
+
+def _load_session_cache():
+    if not os.path.exists(SESSION_CACHE_FILE):
+        return None
+    try:
+        with open(SESSION_CACHE_FILE, "r") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def _save_session_cache(tokens):
+    with open(SESSION_CACHE_FILE, "w") as f:
+        json.dump(tokens, f)
+
+
+def login_with_cache():
+    """
+    Session-aware login. Tries, in order:
+      1. A cached session from earlier today (angel_session.json, restored
+         via GH Actions cache -- see SESSION_CACHE_FILE note above) --
+         renewed via the lightweight generateToken(refresh_token) call,
+         which needs no TOTP and is far cheaper than generateSession().
+      2. A full TOTP-based generateSession(), if there's no cache for
+         today, the cache file is missing/corrupt, or the renewal call
+         itself fails (e.g. refresh token expired/invalidated).
+
+    Either path ends with a fresh angel_session.json written for the next
+    run to pick up, and returns a ready-to-use smart_api object -- same
+    contract as login(), so callers don't need any other changes.
+    """
+    api_key = os.environ["ANGEL_API_KEY"]
+    today_str = dt.date.today().isoformat()  # workflow sets TZ=Asia/Kolkata
+
+    cached = _load_session_cache()
+
+    if cached and cached.get("session_date") == today_str and cached.get("refresh_token"):
+        smart_api = SmartConnect(api_key=api_key)
+        try:
+            resp = smart_api.generateToken(cached["refresh_token"])
+        except Exception as e:
+            resp = None
+            print(f"Session renewal raised {e!r} -- falling back to full login.",
+                  file=sys.stderr)
+
+        if resp and resp.get("status"):
+            print("Angel One session renewed via cached refresh token (no TOTP).")
+            _save_session_cache({
+                "access_token": resp["data"]["jwtToken"],
+                "refresh_token": cached["refresh_token"],  # generateToken doesn't rotate this
+                "feed_token": resp["data"]["feedToken"],
+                "session_date": today_str,
+            })
+            return smart_api
+
+        print(f"Cached session renewal failed ({resp}) -- falling back to full login.",
+              file=sys.stderr)
+
+    # Full TOTP login: first run of the day, no cache, or renewal above failed.
+    client_code = os.environ["ANGEL_CLIENT_CODE"]
+    password = os.environ["ANGEL_PASSWORD"]
+    totp_secret = os.environ["ANGEL_TOTP_SECRET"]
+    totp = pyotp.TOTP(totp_secret).now()
+
+    smart_api = SmartConnect(api_key=api_key)
+    session_data = smart_api.generateSession(client_code, password, totp)
+
+    if not session_data or not session_data.get("status"):
+        print(f"LOGIN FAILED: {session_data}", file=sys.stderr)
+        sys.exit(1)
+
+    print("Angel One login OK (full TOTP login).")
+    _save_session_cache({
+        "access_token": session_data["data"]["jwtToken"],
+        "refresh_token": session_data["data"]["refreshToken"],
+        "feed_token": session_data["data"].get("feedToken") or smart_api.getfeedToken(),
+        "session_date": today_str,
+    })
     return smart_api
 
 
