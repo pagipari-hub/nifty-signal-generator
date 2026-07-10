@@ -223,6 +223,26 @@ def login_with_cache():
         sys.exit(1)
 
     print("Angel One login OK (full TOTP login).")
+
+    # DEBUG (temporary, 2026-07-10 -- investigating AG8001 on cached-session
+    # renewal): NOT logging any token content (these are live credentials).
+    # Only checking whether jwtToken/refreshToken already carry a "Bearer "
+    # prefix baked into the string itself -- a real SmartAPI forum report
+    # (Feb 2026) shows generateSession() returning jwtToken as literally
+    # "Bearer eyJ...". If that's true here too, caching this value and
+    # later handing it to the SDK for an Authorization header could produce
+    # a doubled "Bearer Bearer ..." string -- a plausible explanation for
+    # AG8001 on a token that's only seconds old. This print confirms or
+    # rules that out on the next run without exposing any credential.
+    raw_jwt = session_data["data"]["jwtToken"]
+    raw_refresh = session_data["data"]["refreshToken"]
+    print(
+        f"[DEBUG] jwtToken starts_with_Bearer={raw_jwt.startswith('Bearer ')} "
+        f"len={len(raw_jwt)} | refreshToken starts_with_Bearer="
+        f"{raw_refresh.startswith('Bearer ')} len={len(raw_refresh)}",
+        file=sys.stderr,
+    )
+
     _save_session_cache({
         "access_token": session_data["data"]["jwtToken"],
         "refresh_token": session_data["data"]["refreshToken"],
