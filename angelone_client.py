@@ -172,7 +172,23 @@ def login_with_cache():
     cached = _load_session_cache()
 
     if cached and cached.get("session_date") == today_str and cached.get("refresh_token"):
-        smart_api = SmartConnect(api_key=api_key)
+        # FIX (2026-07-10, missing-Authorization-header bug): a bare
+        # SmartConnect(api_key=api_key) with no access_token set produced
+        # a generateToken() call with NO "Authorization" header at all
+        # (confirmed from the raw headers dump in a rejected call's error
+        # log) -- Angel One's own docs show this endpoint expects
+        # 'Authorization: Bearer <access_token>' alongside the refresh
+        # token in the body. Two consecutive real runs (10:35, 10:45)
+        # both got "Invalid Token" / AG8001 on this exact call. Passing
+        # the cached (likely stale/expired) access_token into the
+        # constructor gives the SDK something to put in that header --
+        # matching Angel One's official constructor pattern
+        # (SmartConnect(api_key=..., access_token=..., refresh_token=...)).
+        smart_api = SmartConnect(
+            api_key=api_key,
+            access_token=cached.get("access_token"),
+            refresh_token=cached["refresh_token"],
+        )
         try:
             resp = smart_api.generateToken(cached["refresh_token"])
         except Exception as e:
