@@ -70,6 +70,92 @@ PRE_CALL_DELAY_SECONDS = 1.5
 # history on every commit; the Actions cache has no such permanence.
 SESSION_CACHE_FILE = "angel_session.json"
 
+# FIX (2026-07-10, AG8001-on-renewal root cause -- source-confirmed, NOT
+# YET VERIFIED against a live run): the SDK's own generateToken() was
+# tried first and failed 4/4 real attempts with AG8001 "Invalid Token" on
+# refresh tokens under 10 minutes old. Two follow-up theories (missing
+# access_token in the constructor; a baked-in "Bearer " prefix on the
+# jwtToken) were both tested and ruled out. Inspecting the SDK's actual
+# source (requestHeaders() in smartapi-python's smartConnect.py) shows it
+# NEVER includes an "Authorization" header -- structurally absent from
+# that method, not conditional on what's passed to the constructor --
+# while Angel One's own REST docs for this exact endpoint
+# (generateTokens) explicitly require "Authorization: Bearer <token>"
+# alongside the refresh token in the request body. This bypasses the
+# SDK's generateToken() entirely and calls the documented REST endpoint
+# directly, building every header per Angel One's own example, so
+# renewal no longer depends on however the SDK does (or doesn't) attach
+# auth internally.
+#
+# Built post-market-close (2026-07-10, 15:30+ IST) -- first real test is
+# the second run of the next trading day (first run of the day forces a
+# full TOTP login since there's no cache yet; the SECOND run is the
+# actual test of this renewal path).
+GENERATE_TOKEN_URL = "https://apiconnect.angelone.in/rest/auth/angelbroking/jwt/v1/generateTokens"
+
+
+def _renew_session_direct(api_key, access_token, refresh_token):
+    """
+    Direct REST call to Angel One's session-renewal endpoint, bypassing
+    the SDK's own generateToken() -- see FIX note above GENERATE_TOKEN_URL
+    for why. Returns a dict with jwtToken/refreshToken/feedToken on
+    success, or None on any failure (bad response shape, network error,
+    non-2xx, or an explicit success=False/status=False body). Never
+    raises -- callers treat None exactly like a failed SDK call and fall
+    back to full login.
+
+    Response shape is defensively checked for BOTH "status" (used by
+    generateSession's success response) and "success" (used by this
+    endpoint's own documented AG8001 error response) keys, since Angel
+    One's API is inconsistent about which key different endpoints use --
+    confirmed inconsistency, not a guess: generateSession successes use
+    "status": true, while every AG8001 error seen today used "success":
+    false. The successful-response shape for THIS endpoint hasn't been
+    observed yet, so both are checked rather than assuming one.
+    """
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "X-UserType": "USER",
+        "X-SourceID": "WEB",
+        "X-ClientLocalIP": "127.0.0.1",
+        "X-ClientPublicIP": "127.0.0.1",
+        "X-MACAddress": "00:00:00:00:00:00",
+        "X-PrivateKey": api_key,
+    }
+    payload = {"refreshToken": refresh_token}
+
+    try:
+        resp = requests.post(GENERATE_TOKEN_URL, headers=headers, json=payload, timeout=15)
+    except requests.RequestException as e:
+        print(f"Direct session renewal request failed: {e!r}", file=sys.stderr)
+        return None
+
+    try:
+        body = resp.json()
+    except ValueError:
+        print(
+            f"Direct session renewal: non-JSON response (status={resp.status_code}): "
+            f"{resp.text[:200]}",
+            file=sys.stderr,
+        )
+        return None
+
+    ok = body.get("status") is True or body.get("success") is True
+    if not ok:
+        print(f"Direct session renewal failed (http_status={resp.status_code}): {body}",
+              file=sys.stderr)
+        return None
+
+    data = body.get("data") or {}
+    if not data.get("jwtToken") or not data.get("refreshToken"):
+        print(f"Direct session renewal: response missing expected token fields: {body}",
+              file=sys.stderr)
+        return None
+
+    return data
+
 
 def _rate_limit_backoff_delay(attempt):
     """
@@ -172,41 +258,26 @@ def login_with_cache():
     cached = _load_session_cache()
 
     if cached and cached.get("session_date") == today_str and cached.get("refresh_token"):
-        # FIX (2026-07-10, missing-Authorization-header bug): a bare
-        # SmartConnect(api_key=api_key) with no access_token set produced
-        # a generateToken() call with NO "Authorization" header at all
-        # (confirmed from the raw headers dump in a rejected call's error
-        # log) -- Angel One's own docs show this endpoint expects
-        # 'Authorization: Bearer <access_token>' alongside the refresh
-        # token in the body. Two consecutive real runs (10:35, 10:45)
-        # both got "Invalid Token" / AG8001 on this exact call. Passing
-        # the cached (likely stale/expired) access_token into the
-        # constructor gives the SDK something to put in that header --
-        # matching Angel One's official constructor pattern
-        # (SmartConnect(api_key=..., access_token=..., refresh_token=...)).
-        smart_api = SmartConnect(
-            api_key=api_key,
-            access_token=cached.get("access_token"),
-            refresh_token=cached["refresh_token"],
+        renewed = _renew_session_direct(
+            api_key, cached.get("access_token"), cached["refresh_token"]
         )
-        try:
-            resp = smart_api.generateToken(cached["refresh_token"])
-        except Exception as e:
-            resp = None
-            print(f"Session renewal raised {e!r} -- falling back to full login.",
-                  file=sys.stderr)
 
-        if resp and resp.get("status"):
-            print("Angel One session renewed via cached refresh token (no TOTP).")
+        if renewed:
+            print("Angel One session renewed via direct REST call (no TOTP).")
+            smart_api = SmartConnect(api_key=api_key)
+            smart_api.setAccessToken(renewed["jwtToken"])
+            smart_api.setRefreshToken(renewed["refreshToken"])
+            if renewed.get("feedToken"):
+                smart_api.setFeedToken(renewed["feedToken"])
             _save_session_cache({
-                "access_token": resp["data"]["jwtToken"],
-                "refresh_token": cached["refresh_token"],  # generateToken doesn't rotate this
-                "feed_token": resp["data"]["feedToken"],
+                "access_token": renewed["jwtToken"],
+                "refresh_token": renewed["refreshToken"],
+                "feed_token": renewed.get("feedToken"),
                 "session_date": today_str,
             })
             return smart_api
 
-        print(f"Cached session renewal failed ({resp}) -- falling back to full login.",
+        print("Cached session renewal (direct REST) failed -- falling back to full login.",
               file=sys.stderr)
 
     # Full TOTP login: first run of the day, no cache, or renewal above failed.
