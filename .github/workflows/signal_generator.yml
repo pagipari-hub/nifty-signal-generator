@@ -58,6 +58,25 @@ jobs:
           path: instrument_master.json
           key: instrument-master-${{ steps.date.outputs.today }}
 
+      # FIX (2026-07-10, session-per-run root cause): previously every run
+      # called angelone_client.login(), a full TOTP-based generateSession(),
+      # every 5 minutes all day. Angel One's docs state a session stays
+      # active until 12 midnight, and the SDK's lightweight
+      # generateToken(refresh_token) renewal (no TOTP) is the intended way
+      # to keep reusing it. angel_session.json holds the cached
+      # access/refresh tokens for angelone_client.login_with_cache() to
+      # reuse across runs -- cached via actions/cache the same way
+      # instrument_master.json is, so it self-invalidates once per trading
+      # day. Deliberately NOT added to the "git add" line below: this file
+      # holds a live credential (refresh token), and committing it would
+      # bake that credential into the repo's permanent git history on
+      # every single run. The Actions cache has no such permanence.
+      - name: Restore Angel One session cache
+        uses: actions/cache@v4
+        with:
+          path: angel_session.json
+          key: angel-session-${{ steps.date.outputs.today }}
+
       - name: Run signal generation
         id: run_strategy
         env:
@@ -69,12 +88,30 @@ jobs:
           WEBHOOK_SHARED_SECRET: ${{ secrets.WEBHOOK_SHARED_SECRET }}
         run: python main.py
 
+      # FIX (alerting): previously a crashed run was silent -- the only way
+      # to find out was manually opening the Actions tab. This fires ONLY
+      # when the step above failed (`if: failure()`), pinging the same
+      # Telegram bot already used for trade alerts so a crash is never
+      # missed during market hours. Requires TELEGRAM_BOT_TOKEN and
+      # TELEGRAM_CHAT_ID to be added as repo secrets (Settings > Secrets
+      # and variables > Actions) -- they currently only exist on Render.
+      - name: Alert on failure
+        if: failure()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          MSG="⚠️ NIFTY signal-generator run FAILED at $(date '+%Y-%m-%d %H:%M:%S %Z'). Check GitHub Actions logs: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d chat_id="${TELEGRAM_CHAT_ID}" \
+            -d text="$MSG" \
+            || echo "Failed to send Telegram alert (non-fatal, won't block the job)."
+
       - name: Commit updated state back to repo
-        id: commit_state
         run: |
           git config user.name "signal-bot"
           git config user.email "actions@github.com"
-          git add state.json prev_day_candles.json candle_history/ 2>/dev/null || true
+          git add state.json prev_day_candles.json candle_history/*.csv 2>/dev/null || true
 
           # Track whether this run actually created a commit, so we know
           # afterward whether a push failure is real or a harmless no-op.
@@ -84,101 +121,18 @@ jobs:
             COMMITTED=true
           fi
 
-          # FIX (2026-07-09, retry-loop -- confirmed data loss, not just a
-          # cosmetic push failure): today produced two separate HEARTBEAT
-          # webhook calls on the same trading day. Root cause: the webhook
-          # call in send_heartbeat_if_needed() is a real, unconditional,
-          # already-confirmed action -- but the state.json write that's
-          # supposed to prevent it firing again only happens AFTERWARD, and
-          # can silently fail to reach origin (see the CONFLICT traces from
-          # runs today -- a run at the concurrency-queue hand-off boundary
-          # races another run's own push). When that happens, the NEXT run
-          # checks out the same stale state.json and repeats whatever
-          # decision the lost run made. For a heartbeat this is just a
-          # duplicate ping; for a freshly-computed pending_signal (the
-          # ONE candle where is_fresh_crossover_signal() is True) it would
-          # be silently unrecoverable -- by the next run, the transition
-          # candle has already passed, and the crossover can never be
-          # detected as "fresh" again. This is a real correctness gap, not
-          # just an alerting gap.
-          #
-          # Fix: a single pull-rebase-push is replaced with a bounded retry
-          # loop. Most of today's races were resolved by the very next
-          # fetch a few seconds later (evidenced by 713-718 all succeeding
-          # immediately after 712 failed) -- so retrying here, inside the
-          # SAME job, catches the common transient case automatically
-          # instead of requiring a whole extra 5-minute cron cycle (or,
-          # worse, silently losing the state that triggered the retry in
-          # the first place). A conflicting rebase is explicitly aborted
-          # before each retry so a failed attempt can never leave the repo
-          # in a broken mid-rebase state that blocks the next attempt.
-          # Backoff is kept short (attempt * 3s, max 4 attempts) to stay
-          # comfortably inside the job's 4-minute timeout even in the
-          # worst case. If all attempts are exhausted, this still fails
-          # loudly exactly as before -- retrying reduces HOW OFTEN this
-          # happens, it doesn't claim to make it impossible.
-          if [ "$COMMITTED" = "true" ]; then
-            MAX_ATTEMPTS=4
-            PUSH_OK=false
-            for attempt in $(seq 1 $MAX_ATTEMPTS); do
-              if [ "$attempt" -gt 1 ]; then
-                DELAY=$((attempt * 3))
-                echo "Retry $attempt/$MAX_ATTEMPTS: waiting ${DELAY}s before re-fetching."
-                sleep "$DELAY"
-              fi
-
-              if ! git pull --rebase origin main; then
-                echo "::warning::attempt $attempt/$MAX_ATTEMPTS: git pull --rebase failed -- aborting rebase and retrying from a fresh fetch."
-                git rebase --abort 2>/dev/null || true
-                continue
-              fi
-
-              if git push; then
-                PUSH_OK=true
-                break
-              fi
-
-              echo "::warning::attempt $attempt/$MAX_ATTEMPTS: git push rejected even after a clean rebase -- remote moved again, retrying."
-            done
-
-            if [ "$PUSH_OK" = "false" ]; then
-              echo "::error::git push failed after $MAX_ATTEMPTS attempts -- state may be out of sync. Likely a persistent remote conflict; pull and inspect state.json manually."
+          # FIX (1.8): the old `git push || echo "Nothing to push"` swallowed
+          # ALL push failures identically, including real conflicts (e.g. two
+          # overlapping runs both committing). A genuine state-sync failure
+          # would print a harmless-looking message and the job would still go
+          # green -- no signal in the Actions UI that anything was wrong.
+          # Now: a push failure after we DID commit something is a real
+          # problem (most likely a remote conflict) and fails the job loudly.
+          # A push failure when we committed nothing is a true no-op.
+          if ! git push; then
+            if [ "$COMMITTED" = "true" ]; then
+              echo "::error::git push failed after committing state.json changes -- state may be out of sync. Likely a remote conflict (e.g. overlapping runs); pull and inspect state.json manually."
               exit 1
             fi
-          else
             echo "Nothing to push."
           fi
-
-      # FIX (alerting gap, 2026-07-09): the original "Alert on failure" step
-      # sat right after "Run signal generation", with `if: failure()`. That
-      # condition only looks at steps BEFORE it in the job -- so it caught a
-      # crashed main.py, but the "Commit updated state back to repo" step
-      # runs AFTER it, meaning a git push/rebase failure there (exactly the
-      # "state may be out of sync" case this repo has hit multiple times --
-      # including a confirmed case of real data loss, see the FIX note
-      # above) fired zero alert. That failure mode is arguably the more
-      # important one to know about immediately, since it means state.json
-      # on GitHub may not reflect what this run actually did.
-      #
-      # Fix: move the alert to be the LAST step in the job (if: failure()
-      # then correctly covers failures from EITHER step), and identify
-      # which step actually failed in the message so it's clear at a
-      # glance whether this was a script crash or a state-sync problem.
-      - name: Alert on failure
-        if: failure()
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: |
-          if [ "${{ steps.run_strategy.outcome }}" = "failure" ]; then
-            REASON="main.py crashed during signal generation"
-          elif [ "${{ steps.commit_state.outcome }}" = "failure" ]; then
-            REASON="git push/rebase failed after retries while committing state.json -- state may be out of sync, inspect manually"
-          else
-            REASON="unknown step failed"
-          fi
-          MSG="⚠️ NIFTY signal-generator run FAILED at $(date '+%Y-%m-%d %H:%M:%S %Z'). Reason: ${REASON}. Check GitHub Actions logs: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-            -d chat_id="${TELEGRAM_CHAT_ID}" \
-            -d text="$MSG" \
-            || echo "Failed to send Telegram alert (non-fatal, won't block the job)."
