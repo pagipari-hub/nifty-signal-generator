@@ -60,7 +60,18 @@ def main():
         send_heartbeat_if_needed(state)
         save_state(state)
 
-        smart_api = ac.login()
+        # FIX (2026-07-10, session-per-run root cause): was ac.login() --
+        # a full TOTP-based generateSession() on every single run, every
+        # 5 minutes, all day. ac.login_with_cache() reuses a cached
+        # session (angel_session.json, restored via GH Actions cache --
+        # see signal_generator.yml) via the lightweight
+        # generateToken(refresh_token) renewal when one exists for today,
+        # and only falls back to a full TOTP login otherwise. See
+        # angelone_client.py's login_with_cache() docstring for the full
+        # root-cause writeup (2026-07-10 case study: CE leg candle fetch
+        # failing outright on the first data call right after a fresh
+        # login, both at 09:35 and 09:45).
+        smart_api = ac.login_with_cache()
         instruments = ac.download_instrument_master()
 
         expiry = get_current_weekly_expiry()
