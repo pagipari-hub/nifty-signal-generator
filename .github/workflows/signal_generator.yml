@@ -1,10 +1,16 @@
 name: NIFTY Weekly Options - Signal Generator (Angel One data)
-# schedule re-sync trigger - 2026-06-24
+# FIX (2026-07-13, dual-trigger root cause): GitHub's own `schedule:` cron
+# is best-effort and documented to drift/delay under load -- unacceptable
+# for a 5-min candle-close check -- so timing authority was moved to an
+# external service that calls workflow_dispatch on its own precise timer
+# (see repo notes / Render service). The `schedule:` block below was never
+# removed when that happened, so BOTH triggers were firing on overlapping
+# ~5-min cadences. `concurrency: cancel-in-progress: false` doesn't prevent
+# this -- it just queues the second run, and two runs landing back-to-back
+# both committing state.json is exactly what produced the
+# non-fast-forward push rejections. workflow_dispatch is now the sole
+# trigger; the external service is the single source of timing truth.
 on:
-  schedule:
-    - cron: "45,50,55 3 * * 1-5"        # 09:15,09:20,09:25 IST
-    - cron: "*/5 4,5,6,7,8,9 * * 1-5"   # 09:30-15:25 IST
-    - cron: "0 10 * * 1-5"              # 15:30 IST, EOD square-off tick
   workflow_dispatch:
 
 permissions:
@@ -107,6 +113,30 @@ jobs:
             -d text="$MSG" \
             || echo "Failed to send Telegram alert (non-fatal, won't block the job)."
 
+      # FIX (2026-07-13, push-rejected-on-fast-forward root cause): the
+      # overlapping-run guard in locking.py (run.lock) is a NO-OP on GitHub
+      # Actions -- run.lock is never added to `git add` below and is never
+      # restored via actions/cache the way instrument_master.json and
+      # angel_session.json are, so every scheduled tick gets a completely
+      # fresh checkout with no lock file present. acquire_run_lock() always
+      # sees the file missing and returns True immediately. The `concurrency:`
+      # block above serializes THIS workflow's own runs, but it can't stop
+      # main from moving between this job's checkout and its push -- e.g. a
+      # manual commit landing on main mid-run, or GitHub coalescing/delaying
+      # scheduled triggers and then firing them in a burst. Any of those
+      # leaves this job's local main behind origin/main, so `git push` gets
+      # a non-fast-forward rejection ("! [rejected] main -> main (fetch
+      # first)") even though nothing is actually wrong -- state.json,
+      # prev_day_candles.json and candle_history/*.csv are pure bot-owned
+      # machine state with well-understood "latest run wins" semantics, not
+      # something that needs a human to resolve a merge conflict on.
+      #
+      # Fix: on a rejected push, pull --rebase with `-X ours` (our commit's
+      # version of these files wins over whatever's upstream) and retry, up
+      # to 3 times. This keeps the original FIX (1.8) behavior for a REAL
+      # problem: if the rebase itself fails outright (e.g. a genuine
+      # unresolvable divergence), we still fail loudly rather than silently
+      # swallowing it.
       - name: Commit updated state back to repo
         run: |
           git config user.name "signal-bot"
@@ -121,18 +151,33 @@ jobs:
             COMMITTED=true
           fi
 
-          # FIX (1.8): the old `git push || echo "Nothing to push"` swallowed
-          # ALL push failures identically, including real conflicts (e.g. two
-          # overlapping runs both committing). A genuine state-sync failure
-          # would print a harmless-looking message and the job would still go
-          # green -- no signal in the Actions UI that anything was wrong.
-          # Now: a push failure after we DID commit something is a real
-          # problem (most likely a remote conflict) and fails the job loudly.
-          # A push failure when we committed nothing is a true no-op.
-          if ! git push; then
-            if [ "$COMMITTED" = "true" ]; then
-              echo "::error::git push failed after committing state.json changes -- state may be out of sync. Likely a remote conflict (e.g. overlapping runs); pull and inspect state.json manually."
+          if [ "$COMMITTED" != "true" ]; then
+            git push || echo "Nothing to push."
+            exit 0
+          fi
+
+          # Retry loop: rebase onto whatever's now on origin/main, letting
+          # OUR version of the bot-owned files win any conflict, then retry
+          # the push. This is safe specifically because every file we
+          # touch here is machine-generated state with no human authorship
+          # to lose -- unlike strategy.py/config.py/etc., which we never
+          # touch in this step.
+          PUSHED=false
+          for i in 1 2 3; do
+            if git push; then
+              PUSHED=true
+              break
+            fi
+
+            echo "Push rejected (attempt $i/3) -- pulling and rebasing, preferring our state files on conflict..."
+            if ! git pull --rebase -X ours origin main; then
+              echo "::error::git rebase failed while reconciling state.json changes -- this is a genuine conflict, not just a fast-forward race. Needs manual inspection."
+              git rebase --abort 2>/dev/null || true
               exit 1
             fi
-            echo "Nothing to push."
+          done
+
+          if [ "$PUSHED" != "true" ]; then
+            echo "::error::git push still failing after 3 rebase-and-retry attempts -- state may be out of sync. Inspect state.json manually."
+            exit 1
           fi
