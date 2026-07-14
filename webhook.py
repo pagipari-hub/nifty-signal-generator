@@ -62,3 +62,33 @@ def send_heartbeat_if_needed(state):
         "time": now_ist().isoformat(),
     })
     state["heartbeat_date"] = today_str
+
+
+def send_strike_lock_alert(atm, leg_pairs, spot_price):
+    """
+    Fires once per day, on the run that actually performs the 9:30 strike
+    lock (main.py only calls this when spot_price_at_lock is non-None --
+    i.e. NOT on the same-day rebuild branch in instrument.py that just
+    re-derives leg_pairs from an already-locked daily_atm on every
+    subsequent run). Mirrors send_heartbeat_if_needed()'s one-shot
+    pattern, but the "already sent today" guard lives in the caller
+    (spot_price_at_lock is None on every run after the first), not here.
+    """
+    lines = [
+        f"🔒 Strikes locked for {now_ist().strftime('%Y-%m-%d')}",
+        f"ATM = {atm}  (spot = {spot_price})",
+    ]
+    for leg in leg_pairs:
+        lines.append(
+            f"{leg['option_type']}: SELL {leg['sell_strike']} / HEDGE {leg['hedge_strike']}"
+        )
+    message = "\n".join(lines)
+
+    send_to_webhook({
+        "action": "STRIKES_LOCKED",
+        "message": message,
+        "atm": atm,
+        "spot_price": spot_price,
+        "leg_pairs": leg_pairs,
+        "time": now_ist().isoformat(),
+    })
