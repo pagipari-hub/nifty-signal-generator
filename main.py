@@ -33,7 +33,7 @@ from instrument import get_or_set_daily_strikes
 from signal_engine import scan_for_new_signal
 from pending import manage_pending_signal
 from position import manage_legacy_single_leg_exit, manage_spread_exit
-from webhook import send_heartbeat_if_needed
+from webhook import send_heartbeat_if_needed, send_strike_lock_alert
 from config import STRIKE_LOCK_TIME
 
 
@@ -85,6 +85,7 @@ def main():
             return
         if spot_price_at_lock is not None:
             print(f"Locked today's strikes: ATM={atm} (spot={spot_price_at_lock}) -> {leg_pairs}")
+            send_strike_lock_alert(atm, leg_pairs, spot_price_at_lock)
 
         prev_day = previous_trading_day(now_ist().date())
         prev_day_cache = load_prev_day_cache(prev_day)
