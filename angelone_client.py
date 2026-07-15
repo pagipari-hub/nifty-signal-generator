@@ -94,6 +94,36 @@ SESSION_CACHE_FILE = "angel_session.json"
 GENERATE_TOKEN_URL = "https://apiconnect.angelone.in/rest/auth/angelbroking/jwt/v1/generateTokens"
 
 
+def _strip_bearer_prefix(token):
+    """
+    FIX (2026-07-15, AG8001 root cause CONFIRMED): the 2026-07-10 debug
+    print (jwtToken starts_with_Bearer=...) was added specifically to
+    test this theory, and the docstring above GENERATE_TOKEN_URL notes it
+    as "tested and ruled out" at the time. The 2026-07-15 09:31 IST live
+    run's actual debug output showed it firing True:
+    "jwtToken starts_with_Bearer=True len=1233 | refreshToken
+    starts_with_Bearer=False len=1027" -- Angel One's generateSession()
+    IS returning jwtToken with a literal "Bearer " prefix baked into the
+    string (refreshToken in the same response does NOT have it -- the
+    API is not uniform about this).
+
+    login_with_cache() was caching that jwtToken verbatim as
+    access_token, and _renew_session_direct() then built the
+    Authorization header as f"Bearer {access_token}" -- doubling the
+    prefix into "Bearer Bearer eyJ...", which Angel One's generateTokens
+    endpoint correctly rejects as AG8001 Invalid Token. This explains
+    why every renewal attempt failed, including on refresh tokens only
+    seconds old -- it was never actually about token age.
+
+    Applied defensively at every point a token is cached or used to
+    build an Authorization header, so this self-heals regardless of
+    which endpoint's response does or doesn't carry the prefix.
+    """
+    if token and token.strip().lower().startswith("bearer "):
+        return token.strip()[len("Bearer "):].strip()
+    return token
+
+
 def _renew_session_direct(api_key, access_token, refresh_token):
     """
     Direct REST call to Angel One's session-renewal endpoint, bypassing
@@ -112,7 +142,16 @@ def _renew_session_direct(api_key, access_token, refresh_token):
     "status": true, while every AG8001 error seen today used "success":
     false. The successful-response shape for THIS endpoint hasn't been
     observed yet, so both are checked rather than assuming one.
+
+    FIX (2026-07-15): strips any "Bearer " prefix from BOTH tokens before
+    building the Authorization header -- see _strip_bearer_prefix() for
+    the root-cause writeup. Defensive here too (not just at the caching
+    point in login_with_cache()) in case an already-cached session from
+    before this fix still carries the doubled prefix.
     """
+    access_token = _strip_bearer_prefix(access_token)
+    refresh_token = _strip_bearer_prefix(refresh_token)
+
     headers = {
         "Authorization": f"Bearer {access_token}",
         "Content-Type": "application/json",
@@ -264,14 +303,23 @@ def login_with_cache():
 
         if renewed:
             print("Angel One session renewed via direct REST call (no TOTP).")
+            # FIX (2026-07-15): strip any "Bearer " prefix before caching
+            # or handing to the SDK -- see _strip_bearer_prefix() for the
+            # root-cause writeup. Unconfirmed whether this renewal
+            # endpoint's own response ever carries the prefix (only
+            # generateSession's jwtToken has been observed doing so so
+            # far), but stripping defensively here is cheap insurance
+            # against the same AG8001 loop recurring via this path.
+            clean_jwt = _strip_bearer_prefix(renewed["jwtToken"])
+            clean_refresh = _strip_bearer_prefix(renewed["refreshToken"])
             smart_api = SmartConnect(api_key=api_key)
-            smart_api.setAccessToken(renewed["jwtToken"])
-            smart_api.setRefreshToken(renewed["refreshToken"])
+            smart_api.setAccessToken(clean_jwt)
+            smart_api.setRefreshToken(clean_refresh)
             if renewed.get("feedToken"):
                 smart_api.setFeedToken(renewed["feedToken"])
             _save_session_cache({
-                "access_token": renewed["jwtToken"],
-                "refresh_token": renewed["refreshToken"],
+                "access_token": clean_jwt,
+                "refresh_token": clean_refresh,
                 "feed_token": renewed.get("feedToken"),
                 "session_date": today_str,
             })
@@ -295,16 +343,11 @@ def login_with_cache():
 
     print("Angel One login OK (full TOTP login).")
 
-    # DEBUG (temporary, 2026-07-10 -- investigating AG8001 on cached-session
-    # renewal): NOT logging any token content (these are live credentials).
-    # Only checking whether jwtToken/refreshToken already carry a "Bearer "
-    # prefix baked into the string itself -- a real SmartAPI forum report
-    # (Feb 2026) shows generateSession() returning jwtToken as literally
-    # "Bearer eyJ...". If that's true here too, caching this value and
-    # later handing it to the SDK for an Authorization header could produce
-    # a doubled "Bearer Bearer ..." string -- a plausible explanation for
-    # AG8001 on a token that's only seconds old. This print confirms or
-    # rules that out on the next run without exposing any credential.
+    # DEBUG (kept, 2026-07-10 -- this print is what CONFIRMED the AG8001
+    # root cause on 2026-07-15's live run: jwtToken came back with
+    # starts_with_Bearer=True. Left in place going forward as a canary --
+    # if Angel One ever changes this API behavior, this line will show it
+    # immediately rather than the bug silently reappearing.
     raw_jwt = session_data["data"]["jwtToken"]
     raw_refresh = session_data["data"]["refreshToken"]
     print(
@@ -314,9 +357,17 @@ def login_with_cache():
         file=sys.stderr,
     )
 
+    # FIX (2026-07-15, AG8001 root cause): strip the confirmed "Bearer "
+    # prefix from jwtToken (and defensively from refreshToken too) before
+    # ever caching it. See _strip_bearer_prefix() docstring for the full
+    # writeup -- this is the actual fix; everywhere else (renewal
+    # endpoint calls, renewal-success caching) is defensive backup.
+    clean_jwt = _strip_bearer_prefix(raw_jwt)
+    clean_refresh = _strip_bearer_prefix(raw_refresh)
+
     _save_session_cache({
-        "access_token": session_data["data"]["jwtToken"],
-        "refresh_token": session_data["data"]["refreshToken"],
+        "access_token": clean_jwt,
+        "refresh_token": clean_refresh,
         "feed_token": session_data["data"].get("feedToken") or smart_api.getfeedToken(),
         "session_date": today_str,
     })
