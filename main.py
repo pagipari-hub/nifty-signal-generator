@@ -17,7 +17,8 @@ This script must NEVER place a real order itself.
 
 This is the orchestrator only -- see the sibling modules for the actual
 logic: config, calendar_utils, locking, state, market_data, instrument,
-indicators, signal_engine, pending, position, webhook, logging_utils.
+indicators, signal_engine, pending, position, webhook, logging_utils,
+candle_priming.
 """
 
 import sys
@@ -34,6 +35,7 @@ from signal_engine import scan_for_new_signal
 from pending import manage_pending_signal
 from position import manage_legacy_single_leg_exit, manage_spread_exit
 from webhook import send_heartbeat_if_needed, send_strike_lock_alert
+from candle_priming import prime_candle_cache
 from config import STRIKE_LOCK_TIME
 
 
@@ -83,13 +85,28 @@ def main():
             else:
                 print("Could not fetch spot price to lock today's strikes, aborting this run.", file=sys.stderr)
             return
-        if spot_price_at_lock is not None:
-            print(f"Locked today's strikes: ATM={atm} (spot={spot_price_at_lock}) -> {leg_pairs}")
-            send_strike_lock_alert(atm, leg_pairs, spot_price_at_lock)
 
+        # FIX (moved up, 2026-07-15): prev_day / prev_day_cache / today_start
+        # now need to exist BEFORE the strike-lock block below, since
+        # prime_candle_cache() (called only on the run that just performed
+        # the lock) needs them to warm up the two sell legs' candle cache
+        # immediately after lock -- see candle_priming.py's docstring for
+        # why this is a dedicated step rather than just waiting for
+        # scan_for_new_signal() to hit the same fetch later in this run.
+        # Root cause this addresses: 2026-07-15 case study, where token
+        # 57345's prev-day fetch was rate-limited on both the 9:31 and
+        # 9:35 runs (each already loaded with a full TOTP re-login just
+        # before it), leaving EMA25 computed with zero previous-day
+        # warm-up (136.51 vs. an expected ~188) and blocking what should
+        # have been a live entry signal on the PE leg both times.
         prev_day = previous_trading_day(now_ist().date())
         prev_day_cache = load_prev_day_cache(prev_day)
         today_start = dt.datetime.combine(now_ist().date(), MARKET_OPEN)
+
+        if spot_price_at_lock is not None:
+            print(f"Locked today's strikes: ATM={atm} (spot={spot_price_at_lock}) -> {leg_pairs}")
+            send_strike_lock_alert(atm, leg_pairs, spot_price_at_lock)
+            prime_candle_cache(leg_pairs, instruments, expiry, smart_api, prev_day, prev_day_cache, today_start)
 
         save_state(state)
 
