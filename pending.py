@@ -22,6 +22,34 @@ from signal_engine import check_entry_signal
 from webhook import send_to_webhook, webhook_confirmed_ok
 
 
+def round_to_half(price):
+    """
+    Rounds a price to the nearest Rs. 0.5 tick (e.g. 95.42 -> 95.5,
+    104.96 -> 105.0, 76.34 -> 76.5). Applied to entry_limit FIRST, then
+    sl_price/target_price are computed from that already-rounded
+    entry_limit and rounded again themselves -- so all three numbers
+    that actually go out in the ENTRY_SPREAD payload are clean 0.5
+    multiples, and the risk/reward relationship between them is computed
+    off the same rounded numbers a human (or the broker) would actually
+    see and act on, not off raw floats that get rounded independently
+    afterward.
+
+    NOTE: this rounds to the nearest 0.5, which is a DIFFERENT (coarser)
+    grid than webhook.py's round_up_to_tick() (nearest 0.05, rounding
+    UP, applied only at the moment of real order placement in LIVE_MODE).
+    That's intentional -- this function produces the "clean" display/
+    strategy-level price that gets locked into pending_signal and shown
+    on Telegram; round_up_to_tick() does a SECOND, broker-tick-aligned
+    rounding pass on top of whatever comes out of here, right before the
+    real Shoonya order is placed. The two don't conflict: 0.5 is always
+    already a multiple of 0.05, so round_up_to_tick() is a no-op on an
+    already-round_to_half()'d price in practice, it's just defensively
+    still applied since it's the one place with the real tick-size
+    contract for the broker.
+    """
+    return round(price * 2) / 2
+
+
 def compute_entry_price(trigger_candle):
     """
     LEGACY -- no longer called by main(). Retained only because the
@@ -56,17 +84,38 @@ def compute_pending_signal(trigger_candle, sell_leg_info, hedge_leg_info, qty):
 
     Target is fixed 1:2 risk:reward off entry_limit, using the resulting
     SL distance as risk.
+
+    FIX (2026-07-16, price rounding): entry_limit/sl_price/target_price
+    were previously left as raw floats straight out of the arithmetic
+    (e.g. entry=95.42, SL=104.96, target=76.34 on a live paper fill) --
+    not tradeable/orderable tick sizes. round_to_half() is applied to
+    entry_limit FIRST (since the low-premium SL-floor threshold check
+    and the risk/target math both key off it), then sl_price and
+    target_price are computed from that already-rounded entry_limit and
+    rounded again themselves at the end. This keeps entry/SL/target
+    internally consistent -- risk = sl_price - entry_limit uses the same
+    rounded entry_limit that actually gets sent to the webhook, rather
+    than computing risk off raw numbers and rounding the three outputs
+    independently afterward (which could silently drift the real RR away
+    from TARGET_RISK_REWARD by up to ~0.5 on each leg).
+
+    NOTE: the LOW_PREMIUM_SL_THRESHOLD check below now runs against the
+    ROUNDED entry_limit, not the raw one -- a raw value on either side of
+    Rs.99 could legitimately round across that threshold, and using the
+    rounded value keeps the floor check consistent with the entry_limit
+    that's actually locked and sent.
     """
     trigger_high = trigger_candle["high"]
     trigger_vwap = trigger_candle["vwap"]
-    entry_limit = trigger_candle["ema5"] * ENTRY_LIMIT_DISCOUNT
+    entry_limit = round_to_half(trigger_candle["ema5"] * ENTRY_LIMIT_DISCOUNT)
 
     sl_price = max(trigger_high, trigger_vwap)
     if entry_limit < LOW_PREMIUM_SL_THRESHOLD:
         sl_price = max(sl_price, entry_limit * (1 + LOW_PREMIUM_SL_MIN_PCT))
+    sl_price = round_to_half(sl_price)
 
     risk = sl_price - entry_limit
-    target_price = entry_limit - TARGET_RISK_REWARD * risk
+    target_price = round_to_half(entry_limit - TARGET_RISK_REWARD * risk)
 
     return {
         "sell_symbol": sell_leg_info["symbol"],
