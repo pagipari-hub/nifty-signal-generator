@@ -62,6 +62,29 @@ def compute_entry_price(trigger_candle):
     return low + 0.40 * (high - low)
 
 
+def round_to_half(price):
+    """
+    Rounds a price to the nearest Rs. 0.5 tick (e.g. 87.07 -> 87.0,
+    95.78 -> 96.0, 69.66 -> 69.5). Applied to entry_limit FIRST, then
+    sl_price/target_price are computed from that already-rounded
+    entry_limit and rounded again themselves -- so all three numbers
+    that actually go out in the ENTRY_SPREAD payload are clean 0.5
+    multiples, and risk/reward is computed off the same rounded numbers
+    that get sent to the webhook/Telegram, not off raw floats rounded
+    independently afterward.
+
+    FIX (2026-07-17): re-added after being silently dropped -- the
+    2026-07-17 EMA5-lag fix (see compute_entry_price() above) was built
+    on top of an older pending.py baseline that predated this rounding
+    pass entirely, so the earlier 0.5-rounding fix never carried forward
+    into that rewrite. Not a revert, just two changes landing on
+    divergent versions of this file. Reapplied here on top of the now-
+    active compute_entry_price() pullback formula, without touching
+    that formula itself.
+    """
+    return round(price * 2) / 2
+
+
 def compute_pending_signal(trigger_candle, sell_leg_info, hedge_leg_info, qty):
     """
     Locks a resting SELL limit order off the just-closed trigger candle N.
@@ -69,16 +92,9 @@ def compute_pending_signal(trigger_candle, sell_leg_info, hedge_leg_info, qty):
     entry_limit is FIXED for the whole resting window: computed once here
     from candle N, never recomputed on candles N+1..N+5.
 
-    FIX (2026-07-17): entry_limit now uses compute_entry_price() -- a 40%
-    pullback from the trigger candle's own low toward its own high --
-    instead of the previous EMA5[N] * ENTRY_LIMIT_DISCOUNT proxy. See
-    compute_entry_price()'s docstring above for the full root-cause
-    writeup (EMA5 lags too far behind price on a fresh, strong crossover,
-    making the old entry_limit structurally unreachable). ENTRY_LIMIT_
-    DISCOUNT / trigger_candle["ema5"] are no longer used here as a
-    result -- left in config.py / the trigger_candle dict for now since
-    other code may still reference them, but no longer part of this
-    calculation.
+    entry_limit uses compute_entry_price() -- a 40% pullback from the
+    trigger candle's own low toward its own high (see that function's
+    docstring for the 2026-07-17 EMA5-lag root-cause writeup).
 
     SL = max(trigger candle's high, trigger candle's VWAP). If entry_limit
     is under Rs.99, SL additionally floors at entry_limit * 1.10 -- this
@@ -87,19 +103,35 @@ def compute_pending_signal(trigger_candle, sell_leg_info, hedge_leg_info, qty):
     absolute SL getting whipsawed).
 
     Target is fixed 1:2 risk:reward off entry_limit, using the resulting
-    SL distance as risk. UNCHANGED in this pass -- see compute_entry_price()
-    docstring note above.
+    SL distance as risk.
+
+    FIX (2026-07-17, rounding re-added): entry_limit/sl_price/target_price
+    are rounded to the nearest 0.5 -- entry_limit FIRST (since the
+    low-premium SL-floor threshold check and the risk/target math both
+    key off it), then sl_price and target_price are computed from that
+    already-rounded entry_limit and rounded again themselves at the end.
+    Keeps entry/SL/target internally consistent: risk = sl_price -
+    entry_limit uses the same rounded entry_limit that's actually sent
+    to the webhook, rather than rounding all three independently after
+    computing off raw floats (which could quietly drift the real RR
+    away from TARGET_RISK_REWARD).
+
+    NOTE: the LOW_PREMIUM_SL_THRESHOLD check runs against the ROUNDED
+    entry_limit, not the raw one -- a raw value near Rs.99 could
+    legitimately round across that threshold, and using the rounded
+    value keeps the floor check consistent with what's actually locked.
     """
     trigger_high = trigger_candle["high"]
     trigger_vwap = trigger_candle["vwap"]
-    entry_limit = compute_entry_price(trigger_candle)
+    entry_limit = round_to_half(compute_entry_price(trigger_candle))
 
     sl_price = max(trigger_high, trigger_vwap)
     if entry_limit < LOW_PREMIUM_SL_THRESHOLD:
         sl_price = max(sl_price, entry_limit * (1 + LOW_PREMIUM_SL_MIN_PCT))
+    sl_price = round_to_half(sl_price)
 
     risk = sl_price - entry_limit
-    target_price = entry_limit - TARGET_RISK_REWARD * risk
+    target_price = round_to_half(entry_limit - TARGET_RISK_REWARD * risk)
 
     return {
         "sell_symbol": sell_leg_info["symbol"],
