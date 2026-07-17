@@ -22,41 +22,40 @@ from signal_engine import check_entry_signal
 from webhook import send_to_webhook, webhook_confirmed_ok
 
 
-def round_to_half(price):
-    """
-    Rounds a price to the nearest Rs. 0.5 tick (e.g. 95.42 -> 95.5,
-    104.96 -> 105.0, 76.34 -> 76.5). Applied to entry_limit FIRST, then
-    sl_price/target_price are computed from that already-rounded
-    entry_limit and rounded again themselves -- so all three numbers
-    that actually go out in the ENTRY_SPREAD payload are clean 0.5
-    multiples, and the risk/reward relationship between them is computed
-    off the same rounded numbers a human (or the broker) would actually
-    see and act on, not off raw floats that get rounded independently
-    afterward.
-
-    NOTE: this rounds to the nearest 0.5, which is a DIFFERENT (coarser)
-    grid than webhook.py's round_up_to_tick() (nearest 0.05, rounding
-    UP, applied only at the moment of real order placement in LIVE_MODE).
-    That's intentional -- this function produces the "clean" display/
-    strategy-level price that gets locked into pending_signal and shown
-    on Telegram; round_up_to_tick() does a SECOND, broker-tick-aligned
-    rounding pass on top of whatever comes out of here, right before the
-    real Shoonya order is placed. The two don't conflict: 0.5 is always
-    already a multiple of 0.05, so round_up_to_tick() is a no-op on an
-    already-round_to_half()'d price in practice, it's just defensively
-    still applied since it's the one place with the real tick-size
-    contract for the broker.
-    """
-    return round(price * 2) / 2
-
-
 def compute_entry_price(trigger_candle):
     """
-    LEGACY -- no longer called by main(). Retained only because the
-    currently-open single-leg position in state.json (opened before the
-    pending-signal rework) was priced with this formula; keeping it here
-    for reference/audit, not for reuse. New entries go through
-    compute_pending_signal() instead.
+    FIX (2026-07-17, EMA5-lag root cause): this was the formula used
+    before the pending-signal rework, then marked LEGACY when
+    compute_pending_signal() switched to EMA5[N] * ENTRY_LIMIT_DISCOUNT
+    as a proxy for candle N+1's open. That EMA5-based anchor turned out
+    to be the wrong choice specifically for FRESH, STRONG crossovers --
+    the exact condition this strategy's entry signal is designed to
+    detect -- because EMA5 lags a fast-falling price by several points
+    per candle (confirmed 2026-07-17: EMA5 dropped 103.02 -> 98.67
+    across a single candle purely from ordinary EMA recursion, no stale
+    prior-day data involved). The resulting entry_limit sat ABOVE the
+    trigger candle's own high, making the resting SELL limit
+    structurally unreachable on a real momentum move -- see the
+    2026-07-17 case study (NIFTY21JUL2624100PE: EMA5-based entry_limit
+    97.87 vs a next-candle high of only 95.15, while price kept falling
+    to 77.95 over the next hour with the "signal" never able to fill).
+
+    Reinstated as the ACTIVE formula for compute_pending_signal(): 40%
+    pullback from the trigger candle's own low toward its own high.
+    Anchored entirely to where price actually traded this candle, not a
+    lagging multi-candle average, so it moves with price instead of
+    behind it. Verified against the 2026-07-17 candles: this formula
+    would have priced the entry at 92.57 (09:30 candle), comfortably
+    reached by the very next candle's high of 95.15, vs. the EMA5-based
+    97.87 which was never reached.
+
+    NOTE (deliberately NOT changed in this pass): SL and target formulas
+    below are UNCHANGED -- still computed off max(high, vwap) and fixed
+    1:2 risk:reward, same as before. Revisiting SL/target (e.g. a
+    swing-high trailing stop, wider risk:reward) is intentionally scoped
+    OUT of this fix and left for a separate change, so this pass is
+    isolated to "is the entry price reachable", not bundled with a
+    change to how risk/reward is managed once filled.
     """
     low = trigger_candle["low"]
     high = trigger_candle["high"]
@@ -66,15 +65,20 @@ def compute_entry_price(trigger_candle):
 def compute_pending_signal(trigger_candle, sell_leg_info, hedge_leg_info, qty):
     """
     Locks a resting SELL limit order off the just-closed trigger candle N.
-    EMA5[N] stands in as the proxy for candle N+1's open (the real open
-    isn't known yet at candle-N-close time -- only 5-min OHLC is available,
-    not tick data). The limit is set at a discount to that proxy, so in
-    practice it's a floor that the very next candle's high almost always
-    clears -- the 5-candle window exists as a safety margin for a single
-    illiquid/gappy print, not because a deep pullback is expected.
 
     entry_limit is FIXED for the whole resting window: computed once here
     from candle N, never recomputed on candles N+1..N+5.
+
+    FIX (2026-07-17): entry_limit now uses compute_entry_price() -- a 40%
+    pullback from the trigger candle's own low toward its own high --
+    instead of the previous EMA5[N] * ENTRY_LIMIT_DISCOUNT proxy. See
+    compute_entry_price()'s docstring above for the full root-cause
+    writeup (EMA5 lags too far behind price on a fresh, strong crossover,
+    making the old entry_limit structurally unreachable). ENTRY_LIMIT_
+    DISCOUNT / trigger_candle["ema5"] are no longer used here as a
+    result -- left in config.py / the trigger_candle dict for now since
+    other code may still reference them, but no longer part of this
+    calculation.
 
     SL = max(trigger candle's high, trigger candle's VWAP). If entry_limit
     is under Rs.99, SL additionally floors at entry_limit * 1.10 -- this
@@ -83,39 +87,19 @@ def compute_pending_signal(trigger_candle, sell_leg_info, hedge_leg_info, qty):
     absolute SL getting whipsawed).
 
     Target is fixed 1:2 risk:reward off entry_limit, using the resulting
-    SL distance as risk.
-
-    FIX (2026-07-16, price rounding): entry_limit/sl_price/target_price
-    were previously left as raw floats straight out of the arithmetic
-    (e.g. entry=95.42, SL=104.96, target=76.34 on a live paper fill) --
-    not tradeable/orderable tick sizes. round_to_half() is applied to
-    entry_limit FIRST (since the low-premium SL-floor threshold check
-    and the risk/target math both key off it), then sl_price and
-    target_price are computed from that already-rounded entry_limit and
-    rounded again themselves at the end. This keeps entry/SL/target
-    internally consistent -- risk = sl_price - entry_limit uses the same
-    rounded entry_limit that actually gets sent to the webhook, rather
-    than computing risk off raw numbers and rounding the three outputs
-    independently afterward (which could silently drift the real RR away
-    from TARGET_RISK_REWARD by up to ~0.5 on each leg).
-
-    NOTE: the LOW_PREMIUM_SL_THRESHOLD check below now runs against the
-    ROUNDED entry_limit, not the raw one -- a raw value on either side of
-    Rs.99 could legitimately round across that threshold, and using the
-    rounded value keeps the floor check consistent with the entry_limit
-    that's actually locked and sent.
+    SL distance as risk. UNCHANGED in this pass -- see compute_entry_price()
+    docstring note above.
     """
     trigger_high = trigger_candle["high"]
     trigger_vwap = trigger_candle["vwap"]
-    entry_limit = round_to_half(trigger_candle["ema5"] * ENTRY_LIMIT_DISCOUNT)
+    entry_limit = compute_entry_price(trigger_candle)
 
     sl_price = max(trigger_high, trigger_vwap)
     if entry_limit < LOW_PREMIUM_SL_THRESHOLD:
         sl_price = max(sl_price, entry_limit * (1 + LOW_PREMIUM_SL_MIN_PCT))
-    sl_price = round_to_half(sl_price)
 
     risk = sl_price - entry_limit
-    target_price = round_to_half(entry_limit - TARGET_RISK_REWARD * risk)
+    target_price = entry_limit - TARGET_RISK_REWARD * risk
 
     return {
         "sell_symbol": sell_leg_info["symbol"],
