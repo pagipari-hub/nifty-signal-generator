@@ -1,6 +1,6 @@
 {
   "open_position": null,
-  "last_run": "2026-07-23T11:26:21.002068+05:30",
+  "last_run": "2026-07-23T11:31:15.471764+05:30",
   "heartbeat_date": "2026-07-23",
   "daily_strikes_date": "2026-07-23",
   "daily_atm": 23900,
@@ -16,5 +16,20 @@
       "option_type": "CE"
     }
   ],
-  "pending_signal": null
+  "pending_signal": {
+    "sell_symbol": "NIFTY28JUL2624000CE",
+    "sell_token": "63939",
+    "sell_strike": 24000,
+    "hedge_symbol": "NIFTY28JUL2624300CE",
+    "hedge_token": "63951",
+    "hedge_strike": 24300,
+    "option_type": "CE",
+    "qty": 65,
+    "entry_limit": 105.5,
+    "sl_price": 112.5,
+    "target_price": 91.5,
+    "trigger_time": "2026-07-23T11:31:15.471664+05:30",
+    "candles_waited": 0,
+    "hedge_entry_price": 25.9
+  }
 }
