@@ -15,7 +15,7 @@ from config import (
     LOW_PREMIUM_SL_MIN_PCT,
     TARGET_RISK_REWARD,
 )
-from calendar_utils import now_ist
+from calendar_utils import now_ist, is_eod_squareoff_time
 from market_data import get_candles_with_cache
 from indicators import compute_indicators
 from signal_engine import check_entry_signal
@@ -161,8 +161,46 @@ def manage_pending_signal(state, instruments, expiry, smart_api, prev_day, prev_
     still true. If price already reached the limit this candle, it fills
     regardless of whether the EMA/VWAP setup broke down by this candle's
     close.
+
+    FIX (2026-07-25, cross-day pending_signal survival bug): this
+    function previously had NO end-of-day check at all -- only fill,
+    cancellation (setup invalidated), and 5-candle expiry. open_position
+    is always force-flattened at EOD_SQUAREOFF (see position.py's
+    manage_spread_exit()/manage_legacy_single_leg_exit()), but a resting
+    pending_signal had no equivalent: if it simply hadn't filled, hadn't
+    been cancelled, and hadn't yet hit PENDING_SIGNAL_MAX_CANDLES by
+    market close, it stayed in state.json completely unchanged and
+    carried straight into the next trading day's state.json with no
+    same-day-only marker on it whatsoever.
+
+    Confirmed root cause, 2026-07-23/24 case study: a pending_signal
+    created on 2026-07-23 under that day's ATM=23900 lock (SELL 23800 PE
+    / HEDGE 23500 PE) never resolved by that day's 15:20 EOD square-off
+    -- because pending_signal had no EOD check to resolve it. It sat
+    untouched in state.json overnight, survived into 2026-07-24 (a day
+    locked under a completely different ATM=23700), and was filled the
+    next morning at 09:32 the moment a fresh candle's high finally
+    touched its stale entry_limit -- a real (paper) trade placed on a
+    strike/side that day's actual locked leg_pairs never included at
+    all. See instrument.py's leg-pair validation (added in main.py, same
+    incident) for the complementary guard that stops a stale signal from
+    being FILLED even if one somehow still gets through; THIS fix stops
+    it from ever surviving past its own trading day in the first place,
+    which is the actual root cause.
+
+    This check runs FIRST, ahead of even the fill check: a resting order
+    this close to close has no time left to be managed properly if it
+    fills, so it's discarded outright rather than filled, regardless of
+    whether price happened to touch entry_limit this same candle.
     """
     pending = state["pending_signal"]
+
+    if is_eod_squareoff_time():
+        print(f"pending_signal for {pending['sell_symbol']} discarded -- "
+              "EOD square-off time reached while still unfilled. A resting "
+              "signal must not survive past its own trading day.")
+        state["pending_signal"] = None
+        return
 
     token_info = ac.resolve_option_token(instruments, expiry, pending["sell_strike"], pending["option_type"])
     if not token_info:
