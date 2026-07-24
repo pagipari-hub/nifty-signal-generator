@@ -39,6 +39,41 @@ from candle_priming import prime_candle_cache
 from config import STRIKE_LOCK_TIME
 
 
+def _pending_signal_matches_locked_legs(pending, leg_pairs):
+    """
+    FIX (2026-07-24, stale-pending_signal-off-a-different-ATM bug):
+    manage_pending_signal() previously trusted whatever was sitting in
+    state["pending_signal"] unconditionally -- it only ever reads
+    pending["sell_strike"]/pending["option_type"] from state.json, and
+    never cross-checks those against the CURRENT run's freshly-locked
+    leg_pairs. state["daily_strikes_date"]/daily_atm get correctly
+    overwritten every new trading day, but nothing analogous ever
+    existed for pending_signal -- it has no created-date/ATM tag at
+    all, so a pending_signal computed under one day's (or one moment's)
+    ATM lock can silently persist into a LATER run under a DIFFERENT
+    ATM lock, and still get filled as if it were current.
+
+    Confirmed root cause, 2026-07-24 case study: a pending_signal for
+    SELL 23800 PE / HEDGE 23500 PE -- which only exists under
+    build_leg_pairs(23900) -- was still sitting in state.json on a
+    9:32 run where the FRESH lock that same run performed was
+    ATM=23700 (leg_pairs: PE 23600/23300, CE 23800/24100). Because
+    state["open_position"] was None and state["pending_signal"] was
+    truthy, main() routed straight to manage_pending_signal() without
+    ever consulting the leg_pairs this run itself had just locked --
+    filling a real (paper) trade on a strike/side that today's actual
+    locked pair never included at all.
+
+    Fix: before handing a resting pending_signal to manage_pending_signal(),
+    confirm its (sell_strike, option_type) pair actually appears in
+    TODAY's currently-locked leg_pairs. If it doesn't, the signal is
+    stale (left over from an earlier ATM lock that was never cleared)
+    and is discarded here -- never filled, never partially managed.
+    """
+    valid_pairs = {(leg["sell_strike"], leg["option_type"]) for leg in leg_pairs}
+    return (pending.get("sell_strike"), pending.get("option_type")) in valid_pairs
+
+
 def main():
     if not is_market_open_now():
         print("Market closed (outside hours or holiday) -- skipping run.")
@@ -128,12 +163,34 @@ def main():
 
         # ---- No open position: manage a resting pending_signal, if any ----
         if state.get("pending_signal") is not None:
-            manage_pending_signal(state, instruments, expiry, smart_api, prev_day, prev_day_cache, today_start)
-            save_state(state)
-            save_prev_day_cache(prev_day, prev_day_cache)
-            return
+            pending = state["pending_signal"]
 
-        # ---- No position, no pending signal: scan for a fresh entry trigger ----
+            # FIX (2026-07-24): validate the resting signal actually belongs
+            # to TODAY's currently-locked leg_pairs before trusting it --
+            # see _pending_signal_matches_locked_legs() docstring above for
+            # the full root-cause writeup. A mismatch means this
+            # pending_signal is stale (left over from an earlier ATM lock
+            # that was never cleared) and must be discarded, never filled.
+            if not _pending_signal_matches_locked_legs(pending, leg_pairs):
+                print(
+                    f"[STALE PENDING_SIGNAL] {pending.get('sell_symbol', '?')} "
+                    f"(sell_strike={pending.get('sell_strike')}, option_type={pending.get('option_type')}) "
+                    f"does not match any leg in today's locked leg_pairs ({leg_pairs}) -- "
+                    "discarding without filling or managing it, and continuing to scan fresh this run.",
+                    file=sys.stderr,
+                )
+                state["pending_signal"] = None
+                # Deliberately fall through to scan_for_new_signal() below in
+                # this SAME run, rather than return -- a stale signal being
+                # discarded shouldn't cost this run its chance to catch a
+                # genuine fresh crossover on today's real leg_pairs.
+            else:
+                manage_pending_signal(state, instruments, expiry, smart_api, prev_day, prev_day_cache, today_start)
+                save_state(state)
+                save_prev_day_cache(prev_day, prev_day_cache)
+                return
+
+        # ---- No position, no (valid) pending signal: scan for a fresh entry trigger ----
         scan_for_new_signal(state, leg_pairs, instruments, expiry, smart_api, prev_day, prev_day_cache, today_start)
         save_state(state)
         save_prev_day_cache(prev_day, prev_day_cache)
