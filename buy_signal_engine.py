@@ -20,25 +20,50 @@ Entry conditions (as specified):
   - EMA25 is below BOTH EMA5 and VWAP        (ema25 < ema5 and ema25 < vwap)
   - EMA5 crosses VWAP from below             (prev candle: ema5 <= vwap,
                                                this candle: ema5 > vwap)
-  -> On that trigger candle N, rest a BUY limit at EMA5[N], to be filled
-     on a later candle whose LOW touches that level (a pullback entry,
-     the buy-side mirror of the sell engine resting a SELL limit for a
-     later HIGH to reach it).
+  -> On that trigger candle N, rest a BUY limit at entry_limit (see
+     below), to be filled on a later candle whose LOW touches that
+     level (a pullback entry, the buy-side mirror of the sell engine
+     resting a SELL limit for a later HIGH to reach it).
 
-SL = min(trigger candle's LOW, trigger candle's VWAP) -- the buy-side
-mirror of the sell engine's SL = max(high, vwap). Taking the lower of
-the two gives the stop more room below entry, same reasoning as the
-sell side taking the higher of the two to give its stop more room above
-entry.
+FIX (2026-07-27, entry/SL/target rework):
 
-Target = entry + BUY_TARGET_RISK_REWARD * (entry - SL)  (fixed 1:3 by
-default, see config.BUY_TARGET_RISK_REWARD).
+Entry: entry_limit = pending.compute_entry_price(trigger_candle) -- the
+SAME 40% pullback formula used on the sell side (trigger candle's own
+low + 0.40 * (high - low)), replacing the earlier EMA5-anchored entry.
+EMA5 lags a fast-moving price the same way on the buy side as it did on
+the sell side (see pending.compute_entry_price()'s docstring for the
+original root-cause writeup) -- the formula itself is direction-
+agnostic (just "40% up the trigger candle's own range from its low"),
+and check_fill_buy()'s `low <= entry_limit` already handles a pullback
+correctly in the buy direction.
+
+SL = LOW of the candle immediately BEFORE the trigger/setup candle
+(candle N-1 -- the same candle _pre_cross_ordering_holds() already
+checks for the setup-forming ordering), not the candle before the
+fill. Fixed at signal-detection time along with entry_limit, never
+recomputed while the signal rests -- anchoring SL to whatever candle
+happens to fill the resting limit (which can be several candles after
+N) would place the stop unpredictably close to entry.
+
+Target = entry + BUY_TARGET_RISK_REWARD * (entry - SL), fixed 1:2
+risk:reward (see config.BUY_TARGET_RISK_REWARD).
+
+Strikes watched: ONLY the two locked SELL-strikes (CE sell_strike +
+PE sell_strike) -- the hedge strikes are never scanned for a buy
+signal. FIX (2026-07-27): scan_for_new_buy_signal_live() previously
+looped over BOTH sell_strike and hedge_strike for the CE leg only,
+which meant a buy trade could fire on a hedge strike (never intended --
+the hedge leg is purely a risk cap for the sell side's spread, not a
+tradeable buy candidate) and the PE sell-strike was never watched at
+all. Now both sell-strikes (CE and PE) are watched, and neither hedge
+strike is.
 """
 
 import sys
 
 from config import BUY_PENDING_SIGNAL_MAX_CANDLES, BUY_TARGET_RISK_REWARD
 from calendar_utils import now_ist
+from pending import compute_entry_price, round_to_half
 
 
 def _condition_holds_buy(row):
@@ -105,13 +130,14 @@ def is_fresh_crossover_signal_buy(df):
     return current and previous_setup_forming
 
 
-def compute_pending_buy_signal(trigger_candle, buy_leg_info, qty):
+def compute_pending_buy_signal(trigger_candle, prev_candle_low, buy_leg_info, qty):
     """
     Locks a resting BUY limit order off the just-closed trigger candle N.
 
-    entry_limit = trigger candle's EMA5, taken literally (no discount
-    applied) -- as specified: "take entry in next candle at ema5". This
-    is a pullback entry: the limit rests at EMA5[N] and fills on a LATER
+    entry_limit = pending.compute_entry_price(trigger_candle) -- the
+    same 40% pullback (trigger candle's own low + 0.40 * (high - low))
+    used on the sell side, rounded to the nearest 0.5 tick. This is a
+    pullback entry: the limit rests at entry_limit and fills on a LATER
     candle whose LOW comes down to touch it (see check_fill_buy()),
     rather than chasing the trigger candle's own close/high.
 
@@ -119,19 +145,25 @@ def compute_pending_buy_signal(trigger_candle, buy_leg_info, qty):
     from candle N only -- never recomputed on candles N+1..N+BUY_
     PENDING_SIGNAL_MAX_CANDLES.
 
-    SL = min(trigger candle's LOW, trigger candle's VWAP).
+    SL = LOW of candle N-1 (the candle immediately before the trigger/
+    setup candle), passed in as prev_candle_low -- fixed here at signal-
+    detection time, same as entry_limit, never recomputed against
+    whichever candle actually fills the resting limit.
 
     Target = entry + BUY_TARGET_RISK_REWARD * (entry - SL), i.e. a fixed
-    1:3 risk:reward off entry_limit by default.
-    """
-    trigger_low = trigger_candle["low"]
-    trigger_vwap = trigger_candle["vwap"]
-    entry_limit = trigger_candle["ema5"]
+    1:2 risk:reward off entry_limit by default.
 
-    sl_price = min(trigger_low, trigger_vwap)
+    NOTE: on a rare gap-up setup candle, prev_candle_low could sit above
+    entry_limit, giving a non-positive "risk". This function does not
+    guard against that case -- it's flagged here rather than silently
+    handled, since deciding what to do (skip the signal entirely? floor
+    the SL some other way?) hasn't been agreed yet.
+    """
+    entry_limit = round_to_half(compute_entry_price(trigger_candle))
+    sl_price = round_to_half(prev_candle_low)
 
     risk = entry_limit - sl_price
-    target_price = entry_limit + BUY_TARGET_RISK_REWARD * risk
+    target_price = round_to_half(entry_limit + BUY_TARGET_RISK_REWARD * risk)
 
     return {
         "buy_symbol": buy_leg_info["symbol"],
@@ -189,8 +221,9 @@ def scan_for_new_buy_signal(candles_by_symbol, compute_indicators_fn, log=True):
 
         if is_fresh_crossover_signal_buy(df):
             trigger_candle = df.iloc[-1].to_dict()
+            prev_candle_low = df.iloc[-2]["low"]
             qty = leg_info.get("lot_size", leg_info.get("qty"))
-            pending = compute_pending_buy_signal(trigger_candle, leg_info, qty)
+            pending = compute_pending_buy_signal(trigger_candle, prev_candle_low, leg_info, qty)
             if log:
                 print(
                     f"PENDING BUY SIGNAL: BUY {pending['buy_symbol']} resting limit @ "
@@ -297,46 +330,54 @@ def _strike_has_open_sell_position(state, strike, option_type):
 def scan_for_new_buy_signal_live(state, leg_pairs, instruments, expiry, smart_api,
                                   prev_day, prev_day_cache, today_start):
     """
-    Live-wired scan for the CE-side buy engine. Reuses the SAME locked CE
-    strikes (sell_strike, hedge_strike) the sell engine already tracks --
-    Pragnesh's call: no new token lookups or candle feeds, stays inside
-    existing Angel One rate limits -- but skips any CE strike that
-    currently has an open SELL position on it (Pragnesh's call: skip on
+    Live-wired scan for the buy engine. Watches ONLY the two locked
+    SELL-strikes -- CE sell_strike and PE sell_strike -- reusing the
+    same locked strikes the sell engine already tracks (Pragnesh's
+    call: no new token lookups or candle feeds, stays inside existing
+    Angel One rate limits) -- but skips a strike if the SELL side
+    currently has an open position on it (Pragnesh's call: skip on
     same-strike overlap, both sides intraday).
+
+    FIX (2026-07-27, hedge-strike bug): this previously looped over
+    BOTH sell_strike and hedge_strike for the CE leg only, which meant
+    a buy trade could fire on a hedge strike -- never intended, since
+    the hedge leg exists purely as a risk cap for the sell side's
+    spread, not as a tradeable buy candidate -- while the PE
+    sell-strike was never watched at all. Now only sell_strike is
+    scanned, across BOTH option types (CE and PE) -- two strikes total,
+    no hedge strikes.
 
     Mirrors signal_engine.scan_for_new_signal()'s single-slot,
     stop-after-first-fire shape.
     """
     for leg in leg_pairs:
-        if leg["option_type"] != "CE":
+        option_type = leg["option_type"]
+        strike = leg["sell_strike"]
+
+        if _strike_has_open_sell_position(state, strike, option_type):
+            print(f"[buy scan] skipping {option_type} {strike} -- sell side already has an open position on this strike.")
             continue
 
-        for strike_key in ("sell_strike", "hedge_strike"):
-            strike = leg[strike_key]
+        token_info = ac.resolve_option_token(instruments, expiry, strike, option_type)
+        if not token_info:
+            continue
 
-            if _strike_has_open_sell_position(state, strike, "CE"):
-                print(f"[buy scan] skipping CE {strike} -- sell side already has an open position on this strike.")
-                continue
+        candles = get_candles_with_cache(smart_api, token_info["token"], prev_day, prev_day_cache, today_start)
+        df = compute_indicators(candles)
+        if df is None:
+            continue
 
-            token_info = ac.resolve_option_token(instruments, expiry, strike, "CE")
-            if not token_info:
-                continue
+        if is_fresh_crossover_signal_buy(df):
+            trigger_candle = df.iloc[-1].to_dict()
+            prev_candle_low = df.iloc[-2]["low"]
+            qty = token_info["lot_size"]
+            leg_info = {**token_info, "strike": strike, "option_type": option_type}
 
-            candles = get_candles_with_cache(smart_api, token_info["token"], prev_day, prev_day_cache, today_start)
-            df = compute_indicators(candles)
-            if df is None:
-                continue
-
-            if is_fresh_crossover_signal_buy(df):
-                trigger_candle = df.iloc[-1].to_dict()
-                qty = token_info["lot_size"]
-                leg_info = {**token_info, "strike": strike, "option_type": "CE"}
-
-                state["pending_buy_signal"] = compute_pending_buy_signal(trigger_candle, leg_info, qty)
-                p = state["pending_buy_signal"]
-                print(f"PENDING BUY SIGNAL: BUY {p['buy_symbol']} resting limit @ {p['entry_limit']:.2f} "
-                      f"(SL={p['sl_price']:.2f}, target={p['target_price']:.2f})")
-                return
+            state["pending_buy_signal"] = compute_pending_buy_signal(trigger_candle, prev_candle_low, leg_info, qty)
+            p = state["pending_buy_signal"]
+            print(f"PENDING BUY SIGNAL: BUY {p['buy_symbol']} resting limit @ {p['entry_limit']:.2f} "
+                  f"(SL={p['sl_price']:.2f}, target={p['target_price']:.2f})")
+            return
 
     print("No buy entry signal this run.")
 
