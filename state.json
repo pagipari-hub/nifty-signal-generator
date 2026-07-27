@@ -1,6 +1,6 @@
 {
   "open_position": null,
-  "last_run": "2026-07-27T14:11:56.733288+05:30",
+  "last_run": "2026-07-27T14:16:29.382499+05:30",
   "heartbeat_date": "2026-07-27",
   "daily_strikes_date": "2026-07-27",
   "daily_atm": 23950,
@@ -28,7 +28,7 @@
     "target_price": 47.94745856672057,
     "risk": 3.0014668542575365,
     "trigger_time": "2026-07-27T14:11:56.733238+05:30",
-    "candles_waited": 0
+    "candles_waited": 1
   },
   "open_buy_position": null
 }
