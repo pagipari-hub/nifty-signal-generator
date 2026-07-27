@@ -22,7 +22,55 @@ candle_priming.
 """
 
 import sys
+import time
 import datetime as dt
+
+# ---------------------------------------------------------------------
+# DEBUG (temporary): log every outbound HTTP request/response at the
+# requests.Session level. This catches EVERYTHING built on `requests` --
+# SmartApi's internal calls (login, getCandleData, ltpData, etc.) and
+# our own webhook.py POSTs -- regardless of import order, because we're
+# patching the Session class itself, not a specific instance. Placed
+# here, before angelone_client/webhook are imported below, so no call
+# is ever made before the patch is active.
+#
+# Only method, URL, status code, and elapsed time are logged -- never
+# headers or body, since Angel One calls carry a live JWT in
+# Authorization and our own webhook calls carry X-Webhook-Secret.
+#
+# This is a temporary diagnostic (same spirit as the other DEBUG blocks
+# in indicators.py / angelone_client.py) -- pull it out once the
+# session-renewal / webhook-retry-duplication questions are answered.
+# ---------------------------------------------------------------------
+import requests
+
+_orig_session_request = requests.Session.request
+
+
+def _logged_session_request(self, method, url, *args, **kwargs):
+    t0 = time.monotonic()
+    ts = time.strftime("%H:%M:%S")
+    try:
+        resp = _orig_session_request(self, method, url, *args, **kwargs)
+        elapsed = time.monotonic() - t0
+        print(
+            f"[HTTP] {ts}  {method:6s} {url}  -> {resp.status_code}  ({elapsed:.2f}s)",
+            file=sys.stderr,
+        )
+        return resp
+    except Exception as e:
+        elapsed = time.monotonic() - t0
+        print(
+            f"[HTTP] {ts}  {method:6s} {url}  -> EXCEPTION {e!r}  ({elapsed:.2f}s)",
+            file=sys.stderr,
+        )
+        raise
+
+
+requests.Session.request = _logged_session_request
+# ---------------------------------------------------------------------
+# End of HTTP logging patch.
+# ---------------------------------------------------------------------
 
 import angelone_client as ac
 from config import MARKET_OPEN
