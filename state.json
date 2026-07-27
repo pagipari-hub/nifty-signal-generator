@@ -1,6 +1,6 @@
 {
   "open_position": null,
-  "last_run": "2026-07-27T14:36:28.931164+05:30",
+  "last_run": "2026-07-27T14:41:33.798193+05:30",
   "heartbeat_date": "2026-07-27",
   "daily_strikes_date": "2026-07-27",
   "daily_atm": 23950,
@@ -18,14 +18,5 @@
   ],
   "pending_signal": null,
   "pending_buy_signal": null,
-  "open_buy_position": {
-    "symbol": "NIFTY28JUL2624350CE",
-    "token": "63953",
-    "strike": 24350,
-    "option_type": "CE",
-    "qty": 65,
-    "entry_price": 4.095707464271901,
-    "sl_price": 3.95,
-    "target_price": 4.532829857087603
-  }
+  "open_buy_position": null
 }
