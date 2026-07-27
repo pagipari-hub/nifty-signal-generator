@@ -73,4 +73,4 @@ TARGET_RISK_REWARD = 2           # target = entry - RR * (SL - entry)
 # ---- Buy-side signal engine (wired into main.py/state.json via
 # buy_signal_engine.py: pending_buy_signal / open_buy_position) ----
 BUY_PENDING_SIGNAL_MAX_CANDLES = 5   # resting window: candles N+1 .. N+5
-BUY_TARGET_RISK_REWARD = 3           # target = entry + RR * (entry - SL)
+BUY_TARGET_RISK_REWARD = 2           # target = entry + RR * (entry - SL)
