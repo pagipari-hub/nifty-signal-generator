@@ -38,30 +38,93 @@ import datetime as dt
 # headers or body, since Angel One calls carry a live JWT in
 # Authorization and our own webhook calls carry X-Webhook-Secret.
 #
+# FIX (2026-07-28, rate-limit-mystery investigation): the previous
+# version of this patch logged whole-second timestamps and the raw URL
+# (`[HTTP] {ts}  {method:6s} {url}  -> {resp.status_code}  ({elapsed:.2f}s)`).
+# That was enough to confirm WHICH calls ran but not their true spacing --
+# whole-second resolution can't distinguish "0.9s apart" from "0.1s
+# apart", and long raw URLs push the actually-useful info off small
+# screens / off the visible part of a scrolled log. Switched to
+# millisecond-precision timestamps and a short friendly operation name
+# (derived from the URL) so real call-to-call gaps are visible at a
+# glance, matching the format used when eyeballing this against Angel
+# One's rate-limit windows.
+#
+# Only recognizes endpoints THIS process actually calls (Angel One data
+# APIs, our own webhook POST, ipify). Order placement (placeOrder) is a
+# Shoonya call made by the separate bridge repo on Render, in a
+# different process -- it will never show up in this log. If that needs
+# to be correlated against these timestamps, this same patch (or its
+# friendly-name table) needs to be added to the bridge's own code too.
+#
 # This is a temporary diagnostic (same spirit as the other DEBUG blocks
 # in indicators.py / angelone_client.py) -- pull it out once the
-# session-renewal / webhook-retry-duplication questions are answered.
+# session-renewal / webhook-retry-duplication / rate-limit questions are
+# answered.
 # ---------------------------------------------------------------------
 import requests
 
 _orig_session_request = requests.Session.request
 
+# Ordered (first-match-wins) substring -> friendly-name table. Checked
+# case-insensitively against the full URL. Extend this if Angel One's
+# SDK starts hitting an endpoint not already covered here -- unmatched
+# URLs still get logged, just with a fallback label (see
+# _friendly_call_name below), so nothing is ever silently dropped.
+_CALL_NAME_PATTERNS = [
+    ("generatetokens", "generateTokens"),
+    ("generatesession", "generateSession"),
+    ("getcandledata", "getCandleData"),
+    ("gethistoricaldata", "getCandleData"),
+    ("ltpdata", "getLTP"),
+    ("getltpdata", "getLTP"),
+    ("placeorder", "placeOrder"),
+    ("modifyorder", "modifyOrder"),
+    ("cancelorder", "cancelOrder"),
+    ("orderbook", "getOrderBook"),
+    ("orderhistory", "getOrderHistory"),
+    ("ipify.org", "getPublicIP"),
+]
+
+
+def _friendly_call_name(url):
+    """
+    Maps a full request URL to a short, readable operation name for the
+    HTTP log line. Falls back to the last non-empty path segment (or the
+    bare host, if the path is empty) so an unrecognized endpoint is still
+    identifiable rather than silently mislabeled.
+    """
+    lowered = url.lower()
+    for needle, label in _CALL_NAME_PATTERNS:
+        if needle in lowered:
+            return label
+
+    path = url.split("?", 1)[0].rstrip("/")
+    segment = path.rsplit("/", 1)[-1]
+    if segment and not segment.startswith("http"):
+        return segment
+
+    # Bare host fallback (e.g. a webhook POST straight to a domain root).
+    host = url.split("//", 1)[-1].split("/", 1)[0]
+    return host or url
+
 
 def _logged_session_request(self, method, url, *args, **kwargs):
     t0 = time.monotonic()
-    ts = time.strftime("%H:%M:%S")
+    ts = dt.datetime.now().strftime("%H:%M:%S.%f")[:-3]  # millisecond precision
+    call_name = _friendly_call_name(url)
     try:
         resp = _orig_session_request(self, method, url, *args, **kwargs)
         elapsed = time.monotonic() - t0
         print(
-            f"[HTTP] {ts}  {method:6s} {url}  -> {resp.status_code}  ({elapsed:.2f}s)",
+            f"{ts}  {call_name:16s} -> {resp.status_code}  ({elapsed:.3f}s)",
             file=sys.stderr,
         )
         return resp
     except Exception as e:
         elapsed = time.monotonic() - t0
         print(
-            f"[HTTP] {ts}  {method:6s} {url}  -> EXCEPTION {e!r}  ({elapsed:.2f}s)",
+            f"{ts}  {call_name:16s} -> EXCEPTION {e!r}  ({elapsed:.3f}s)",
             file=sys.stderr,
         )
         raise
