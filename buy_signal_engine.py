@@ -39,6 +39,7 @@ import sys
 
 from config import BUY_PENDING_SIGNAL_MAX_CANDLES, BUY_TARGET_RISK_REWARD
 from calendar_utils import now_ist
+from pending import round_to_half
 
 
 def _condition_holds_buy(row):
@@ -105,7 +106,7 @@ def is_fresh_crossover_signal_buy(df):
     return current and previous_setup_forming
 
 
-def compute_pending_buy_signal(trigger_candle, buy_leg_info, qty):
+def compute_pending_buy_signal(trigger_candle, buy_leg_info, qty, prev_candle=None):
     """
     Locks a resting BUY limit order off the just-closed trigger candle N.
 
@@ -119,19 +120,44 @@ def compute_pending_buy_signal(trigger_candle, buy_leg_info, qty):
     from candle N only -- never recomputed on candles N+1..N+BUY_
     PENDING_SIGNAL_MAX_CANDLES.
 
-    SL = min(trigger candle's LOW, trigger candle's VWAP).
+    SL = min(trigger candle's LOW, trigger candle's VWAP), additionally
+    floored against candle N-1's LOW when available (see FIX below).
 
     Target = entry + BUY_TARGET_RISK_REWARD * (entry - SL), i.e. a fixed
     1:3 risk:reward off entry_limit by default.
+
+    FIX (2026-07-29, SL-too-tight): the original two-way min(low, vwap)
+    was landing too close to entry on tight-range trigger candles,
+    leaving almost no room before an ordinary pullback stopped the
+    position out. Pragnesh's call: additionally floor SL against the
+    LOW of the candle immediately BEFORE the trigger candle (candle
+    N-1) when one is available -- take the WIDEST (i.e. lowest) of
+    trigger_low, trigger_vwap, and prev_candle_low, never narrower than
+    the original two-way min. prev_candle is optional (None right after
+    market open, when there's no N-1 candle yet) -- SL falls back to the
+    original two-way min in that case.
+
+    FIX (2026-07-29, unrounded prices): entry_limit/sl_price/target_price
+    are now rounded to the nearest 0.5 tick via pending.round_to_half()
+    -- mirrors the sell side's 2026-07-17 rounding fix
+    (pending.compute_pending_signal()). Previously these were raw floats
+    (entry_limit was a raw EMA5 value with no rounding at all).
+    Rounded in the same order as the sell side: entry_limit first, then
+    sl_price, then risk/target_price computed off the already-rounded
+    values -- so the real risk:reward sent to the webhook matches
+    BUY_TARGET_RISK_REWARD exactly rather than drifting off raw floats.
     """
     trigger_low = trigger_candle["low"]
     trigger_vwap = trigger_candle["vwap"]
-    entry_limit = trigger_candle["ema5"]
+    entry_limit = round_to_half(trigger_candle["ema5"])
 
     sl_price = min(trigger_low, trigger_vwap)
+    if prev_candle is not None:
+        sl_price = min(sl_price, prev_candle["low"])
+    sl_price = round_to_half(sl_price)
 
     risk = entry_limit - sl_price
-    target_price = entry_limit + BUY_TARGET_RISK_REWARD * risk
+    target_price = round_to_half(entry_limit + BUY_TARGET_RISK_REWARD * risk)
 
     return {
         "buy_symbol": buy_leg_info["symbol"],
@@ -189,8 +215,9 @@ def scan_for_new_buy_signal(candles_by_symbol, compute_indicators_fn, log=True):
 
         if is_fresh_crossover_signal_buy(df):
             trigger_candle = df.iloc[-1].to_dict()
+            prev_candle = df.iloc[-2].to_dict()
             qty = leg_info.get("lot_size", leg_info.get("qty"))
-            pending = compute_pending_buy_signal(trigger_candle, leg_info, qty)
+            pending = compute_pending_buy_signal(trigger_candle, leg_info, qty, prev_candle)
             if log:
                 print(
                     f"PENDING BUY SIGNAL: BUY {pending['buy_symbol']} resting limit @ "
@@ -297,60 +324,71 @@ def _strike_has_open_sell_position(state, strike, option_type):
 def scan_for_new_buy_signal_live(state, leg_pairs, instruments, expiry, smart_api,
                                   prev_day, prev_day_cache, today_start, run_cache=None):
     """
-    Live-wired scan for the CE-side buy engine. Reuses the SAME locked CE
-    strikes (sell_strike, hedge_strike) the sell engine already tracks --
-    Pragnesh's call: no new token lookups or candle feeds, stays inside
-    existing Angel One rate limits -- but skips any CE strike that
-    currently has an open SELL position on it (Pragnesh's call: skip on
-    same-strike overlap, both sides intraday).
+    Live-wired scan for the buy engine. Reuses the SAME locked sell
+    strikes (one CE, one PE) the sell engine already tracks -- no new
+    token lookups beyond what the sell side already resolves each day --
+    but skips any strike that currently has an open SELL position on it
+    (Pragnesh's call: skip on same-strike overlap, both sides intraday).
 
     Mirrors signal_engine.scan_for_new_signal()'s single-slot,
     stop-after-first-fire shape.
 
-    FIX (2026-07-29, run-level dedup): the "no new token lookups or
-    candle feeds" claim in the docstring above was true for token
-    lookups, but NOT for candle feeds -- this loop's "sell_strike" branch
-    resolves to the exact same token signal_engine.scan_for_new_signal()
-    already fetches earlier in the same run, and was calling
-    get_candles_with_cache() again from scratch for it, with no memory
-    of the earlier fetch. Confirmed via a 2026-07-28 live run log showing
-    two separate getCandleData calls, seconds apart, for the same CE
-    sell-strike token. Now accepts run_cache and passes it through --
-    when scan_for_new_signal() (or priming) already fetched this token
-    this run, this call becomes a free in-memory hit instead of a second
-    real API call. See market_data.get_candles_with_cache()'s docstring
-    for the full root-cause writeup.
+    FIX (2026-07-29, run-level dedup): get_candles_with_cache() only ever
+    de-duplicated the PREVIOUS day's candles, and only across separate
+    runs -- nothing stopped this loop from re-fetching TODAY's candles
+    for a token the sell engine had already fetched moments earlier in
+    the same run. Confirmed via a 2026-07-28 live run log showing two
+    separate getCandleData calls, seconds apart, for the same sell-strike
+    token. Now accepts run_cache and passes it through -- when
+    scan_for_new_signal() (or priming) already fetched this token this
+    run, this call becomes a free in-memory hit instead of a second real
+    API call. See market_data.get_candles_with_cache()'s docstring for
+    the full root-cause writeup.
+
+    FIX (2026-07-29, hedge-leg + CE-only scope correction): previously
+    this looped BOTH sell_strike and hedge_strike as independent buy
+    crossover candidates -- taking real buy trades on the hedge strike
+    too, which was never intended (BUY_ENGINE_INTEGRATION.md section 3
+    only ever describes the SELL strike as what the buy engine watches)
+    -- and was hardcoded to CE only. Pragnesh's call: limit buy scanning
+    to exactly the two SELL strikes (ATM+100 CE and ATM-100 PE),
+    dropping both hedge strikes from buy-signal scanning entirely, and
+    extending the mirror-image bullish-crossover check to the PE sell
+    strike too (no longer CE-only). The crossover/entry/SL/target math
+    itself (is_fresh_crossover_signal_buy, compute_pending_buy_signal)
+    was always option-type-agnostic -- it operates on whatever candle
+    series it's given -- so this is purely a scope change in which
+    strike/option_type this loop resolves and fetches, not a change to
+    any underlying signal logic.
     """
     for leg in leg_pairs:
-        if leg["option_type"] != "CE":
+        strike = leg["sell_strike"]
+        option_type = leg["option_type"]
+
+        if _strike_has_open_sell_position(state, strike, option_type):
+            print(f"[buy scan] skipping {option_type} {strike} -- sell side already has an open position on this strike.")
             continue
 
-        for strike_key in ("sell_strike", "hedge_strike"):
-            strike = leg[strike_key]
+        token_info = ac.resolve_option_token(instruments, expiry, strike, option_type)
+        if not token_info:
+            continue
 
-            if _strike_has_open_sell_position(state, strike, "CE"):
-                print(f"[buy scan] skipping CE {strike} -- sell side already has an open position on this strike.")
-                continue
+        candles = get_candles_with_cache(smart_api, token_info["token"], prev_day, prev_day_cache, today_start, run_cache)
+        df = compute_indicators(candles)
+        if df is None:
+            continue
 
-            token_info = ac.resolve_option_token(instruments, expiry, strike, "CE")
-            if not token_info:
-                continue
+        if is_fresh_crossover_signal_buy(df):
+            trigger_candle = df.iloc[-1].to_dict()
+            prev_candle = df.iloc[-2].to_dict()
+            qty = token_info["lot_size"]
+            leg_info = {**token_info, "strike": strike, "option_type": option_type}
 
-            candles = get_candles_with_cache(smart_api, token_info["token"], prev_day, prev_day_cache, today_start, run_cache)
-            df = compute_indicators(candles)
-            if df is None:
-                continue
-
-            if is_fresh_crossover_signal_buy(df):
-                trigger_candle = df.iloc[-1].to_dict()
-                qty = token_info["lot_size"]
-                leg_info = {**token_info, "strike": strike, "option_type": "CE"}
-
-                state["pending_buy_signal"] = compute_pending_buy_signal(trigger_candle, leg_info, qty)
-                p = state["pending_buy_signal"]
-                print(f"PENDING BUY SIGNAL: BUY {p['buy_symbol']} resting limit @ {p['entry_limit']:.2f} "
-                      f"(SL={p['sl_price']:.2f}, target={p['target_price']:.2f})")
-                return
+            state["pending_buy_signal"] = compute_pending_buy_signal(trigger_candle, leg_info, qty, prev_candle)
+            p = state["pending_buy_signal"]
+            print(f"PENDING BUY SIGNAL: BUY {p['buy_symbol']} resting limit @ {p['entry_limit']:.2f} "
+                  f"(SL={p['sl_price']:.2f}, target={p['target_price']:.2f})")
+            return
 
     print("No buy entry signal this run.")
 
