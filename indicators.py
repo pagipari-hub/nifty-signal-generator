@@ -12,6 +12,7 @@ from calendar_utils import now_ist
 
 
 CANDLE_WINDOW_SECONDS = 300  # 5-minute candles
+ATR_PERIOD = 14  # Wilder's smoothing, same convention as EMA5/EMA25's span
 
 
 def _drop_unclosed_last_candle(df):
@@ -90,6 +91,31 @@ def compute_indicators(candles):
     df["ema5"] = df["close"].ewm(span=5, adjust=False).mean()
     df["ema25"] = df["close"].ewm(span=25, adjust=False).mean()
 
+    # NEW (2026-07-30, squeeze-detection groundwork): ATR(14), Wilder's
+    # smoothing (ewm with alpha=1/period), same full-history warmup
+    # pattern as EMA5/EMA25 above -- computed BEFORE the today-filter so
+    # early-morning candles still get a warmed-up value from the prior
+    # session's tail, exactly like EMA5/EMA25 already do. True range
+    # needs the prior candle's close; the very first row in the whole
+    # fetched history has no prior close, so its tr2/tr3 are NaN and
+    # pandas' row-wise max() falls back to tr1 (high-low) for that one
+    # row only -- not a problem in practice since that row is always
+    # from well before today given the multi-day candle history fetched.
+    # Purely additive: nothing below reads df["atr"] yet, this just makes
+    # it available for the squeeze-metrics diagnostics being logged from
+    # buy_signal_engine.py while real threshold values are gathered from
+    # paper-mode data (no signal is gated on this yet).
+    prev_close = df["close"].shift(1)
+    tr = pd.concat(
+        [
+            df["high"] - df["low"],
+            (df["high"] - prev_close).abs(),
+            (df["low"] - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    df["atr"] = tr.ewm(alpha=1 / ATR_PERIOD, adjust=False).mean()
+
     today_mask = df["time"].dt.date == today
     typical_price = (df["high"] + df["low"] + df["close"]) / 3
     cum_vol = df["volume"].where(today_mask, 0).cumsum()
@@ -160,3 +186,51 @@ def compute_indicators(candles):
               "continuing without it.", file=sys.stderr)
 
     return df
+
+
+def compute_squeeze_metrics(row):
+    """
+    NEW (2026-07-30, diagnostic only -- does not gate any signal yet).
+
+    How tightly EMA5/EMA25/VWAP are bunched together on a given
+    indicator row -- the working theory (Pragnesh, 2026-07-30) is that
+    crossover signals fired while these three are in a "squeeze" are
+    disproportionately the ones that get stopped out, because (a) SL
+    distance is itself derived from how close price/vwap sit to entry,
+    so a squeeze mechanically produces a tight SL, and (b) a squeeze is
+    also when EMA5/VWAP tend to whipsaw back and forth, producing
+    repeated low-conviction "fresh crossovers" rather than one clean one.
+
+    Returns (spread, spread_pct, spread_atr_ratio):
+      - spread           = max(ema5, ema25, vwap) - min(ema5, ema25, vwap)
+      - spread_pct       = spread / vwap * 100 -- scale-invariant across
+                            different strikes/premium levels/days, so a
+                            fixed threshold means roughly the same thing
+                            regardless of whether the premium is Rs. 40
+                            or Rs. 400.
+      - spread_atr_ratio = spread / atr -- how tight the bunching is
+                            RELATIVE to how much this specific option's
+                            premium is actually moving right now. None if
+                            ATR isn't available yet (e.g. very first
+                            candles of the whole fetched history) or is
+                            zero, since dividing by it would be
+                            meaningless.
+
+    No thresholds are applied here on purpose -- the plan is to log
+    these values during paper trading first (see buy_signal_engine.py's
+    scan debug output) and pick real cutoffs from what a squeeze vs. a
+    clean signal actually look like in this specific data, rather than
+    guessing numbers with no premium-level calibration behind them.
+    """
+    values = [row["ema5"], row["ema25"], row["vwap"]]
+    spread = max(values) - min(values)
+
+    vwap = row["vwap"]
+    spread_pct = (spread / vwap * 100) if vwap else float("inf")
+
+    atr = row["atr"]
+    spread_atr_ratio = None
+    if atr is not None and not pd.isna(atr) and atr > 0:
+        spread_atr_ratio = spread / atr
+
+    return spread, spread_pct, spread_atr_ratio
