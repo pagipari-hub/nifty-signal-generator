@@ -6,6 +6,8 @@ docstring for why it's defensively wrapped.
 
 import sys
 
+from indicators import compute_squeeze_metrics
+
 
 def log_signal_debug(symbol, df):
     """
@@ -88,6 +90,24 @@ def log_signal_debug(symbol, df):
                 f"{'fresh crossover' if not prev_below else 'state already held'})",
                 file=sys.stderr,
             )
+
+        # NEW (2026-07-30, squeeze diagnostics): sell-side counterpart to
+        # the logging already added to buy_signal_engine.py's scan loops.
+        # Real paper-mode evidence (2026-07-30 13:15 trigger on
+        # NIFTY04AUG2624350CE: spread_pct=0.19%, spread_atr_ratio=0.017,
+        # confirmed against Zerodha's own ATR(14)=8.28) showed this SELL
+        # signal fired inside an extreme squeeze immediately before a
+        # violent whipsaw candle filled it with very little room -- so
+        # this diagnostic belongs on the sell side too, not just buy.
+        # No gating yet -- see indicators.compute_squeeze_metrics()
+        # docstring; this is purely for collecting real threshold data
+        # from live paper runs on both sides before any filter is wired in.
+        _, spread_pct, spread_atr_ratio = compute_squeeze_metrics(last)
+        ratio_str = f"{spread_atr_ratio:.3f}" if spread_atr_ratio is not None else "n/a"
+        print(
+            f"[squeeze diag] spread_pct={spread_pct:.3f}% spread/atr={ratio_str}",
+            file=sys.stderr,
+        )
     except Exception as e:
         # Never let a logging/formatting problem take down a run that's
         # managing real positions. Report it and move on.
