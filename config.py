@@ -70,6 +70,15 @@ LOW_PREMIUM_SL_THRESHOLD = 99    # Rs. -- below this, SL floor kicks in
 LOW_PREMIUM_SL_MIN_PCT = 0.10    # SL floor = entry_limit * (1 + this)
 TARGET_RISK_REWARD = 2           # target = entry - RR * (SL - entry)
 
+# NEW (2026-07-31): buy-side counterpart to the two constants above --
+# same threshold/pct (Pragnesh's call), applied in the opposite direction
+# since buy's SL sits BELOW entry, not above. See
+# buy_signal_engine.compute_pending_buy_signal()'s docstring for why this
+# was missing until now (all 7 paper buy trades to date hit SL, several
+# on sub-Rs.99 premiums, with no floor at all on that side).
+BUY_LOW_PREMIUM_SL_THRESHOLD = 99   # Rs. -- below this, SL floor kicks in
+BUY_LOW_PREMIUM_SL_MIN_PCT = 0.10   # SL floor = entry_limit * (1 - this)
+
 # ---- Buy-side signal engine (wired into main.py/state.json via
 # buy_signal_engine.py: pending_buy_signal / open_buy_position) ----
 BUY_PENDING_SIGNAL_MAX_CANDLES = 5   # resting window: candles N+1 .. N+5
