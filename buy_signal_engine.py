@@ -37,7 +37,10 @@ default, see config.BUY_TARGET_RISK_REWARD).
 
 import sys
 
-from config import BUY_PENDING_SIGNAL_MAX_CANDLES, BUY_TARGET_RISK_REWARD
+from config import (
+    BUY_PENDING_SIGNAL_MAX_CANDLES, BUY_TARGET_RISK_REWARD,
+    BUY_LOW_PREMIUM_SL_THRESHOLD, BUY_LOW_PREMIUM_SL_MIN_PCT,
+)
 from calendar_utils import now_ist
 from pending import round_to_half
 from indicators import compute_squeeze_metrics
@@ -147,6 +150,19 @@ def compute_pending_buy_signal(trigger_candle, buy_leg_info, qty, prev_candle=No
     sl_price, then risk/target_price computed off the already-rounded
     values -- so the real risk:reward sent to the webhook matches
     BUY_TARGET_RISK_REWARD exactly rather than drifting off raw floats.
+
+    NEW (2026-07-31, low-premium SL floor): mirrors the sell side's
+    LOW_PREMIUM_SL_THRESHOLD/MIN_PCT treatment (pending.compute_pending_signal()),
+    inverted for direction -- buy's SL sits BELOW entry, so the floor
+    widens it DOWNWARD (min, not max) when entry_limit is under
+    BUY_LOW_PREMIUM_SL_THRESHOLD (Rs.99, same as sell). Same widen-only
+    contract: this can only push SL further from entry, never closer than
+    what min(low, vwap, prev_low) already computed. Checked against the
+    ROUNDED entry_limit, same reasoning as the sell side's NOTE on this.
+    All 7 paper buy trades to date hit SL, several on sub-Rs.99 premiums
+    (e.g. Rs.3.95, Rs.17.95, Rs.17.07) with no floor at all on this side
+    before this fix -- real motivation for adding it now rather than
+    leaving it deferred.
     """
     trigger_low = trigger_candle["low"]
     trigger_vwap = trigger_candle["vwap"]
@@ -155,6 +171,8 @@ def compute_pending_buy_signal(trigger_candle, buy_leg_info, qty, prev_candle=No
     sl_price = min(trigger_low, trigger_vwap)
     if prev_candle is not None:
         sl_price = min(sl_price, prev_candle["low"])
+    if entry_limit < BUY_LOW_PREMIUM_SL_THRESHOLD:
+        sl_price = min(sl_price, entry_limit * (1 - BUY_LOW_PREMIUM_SL_MIN_PCT))
     sl_price = round_to_half(sl_price)
 
     risk = entry_limit - sl_price
