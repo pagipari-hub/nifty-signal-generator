@@ -189,46 +189,84 @@ def main():
 
             save_state(state)
             save_prev_day_cache(prev_day, prev_day_cache)
-            return
 
-        # ---- No open position: manage a resting pending_signal, if any ----
-        if state.get("pending_signal") is not None:
-            pending = state["pending_signal"]
+            # FIX (2026-07-31, missed-CE-while-PE-open bug): previously
+            # returned here, which blocked buy-side scanning ENTIRELY
+            # whenever sell had ANY open position -- even on a completely
+            # different strike/option_type. Confirmed via real paper data
+            # (2026-07-31): PE 24250 sell position open and working while
+            # CE 24450 ran 52 -> 70+ in the same window, and the buy engine
+            # never got a chance to scan it, because this return exited the
+            # whole run before scan_for_new_buy_signal_live() was ever
+            # reached. scan_for_new_buy_signal_live()'s own per-strike guard
+            # (_strike_has_open_sell_position()) already correctly scopes
+            # the block to just the SAME strike sell is holding -- it was
+            # simply unreachable behind this coarser early return. Falling
+            # through instead of returning lets the OTHER strike still be
+            # scanned/traded, at the cost of one extra candle fetch this
+            # run (the non-conflicting strike) -- no worse than a normal
+            # no-position run, which already fetches both legs (see
+            # scan_for_new_signal()'s per-leg loop below).
+            #
+            # Deliberately does NOT fall through to scan_for_new_signal()
+            # below (that stays inside the "no open position" branch) --
+            # sell already had its turn managing the open position this
+            # run; this only skips the early return, not the
+            # already-correct "don't also scan for a NEW sell entry while
+            # one's still open" rule.
+        else:
+            # ---- No open position: manage a resting pending_signal, if any ----
+            if state.get("pending_signal") is not None:
+                pending = state["pending_signal"]
 
-            # FIX (2026-07-24): validate the resting signal actually belongs
-            # to TODAY's currently-locked leg_pairs before trusting it --
-            # see _pending_signal_matches_locked_legs() docstring above for
-            # the full root-cause writeup. A mismatch means this
-            # pending_signal is stale (left over from an earlier ATM lock
-            # that was never cleared) and must be discarded, never filled.
-            if not _pending_signal_matches_locked_legs(pending, leg_pairs):
-                print(
-                    f"[STALE PENDING_SIGNAL] {pending.get('sell_symbol', '?')} "
-                    f"(sell_strike={pending.get('sell_strike')}, option_type={pending.get('option_type')}) "
-                    f"does not match any leg in today's locked leg_pairs ({leg_pairs}) -- "
-                    "discarding without filling or managing it, and continuing to scan fresh this run.",
-                    file=sys.stderr,
-                )
-                state["pending_signal"] = None
-                # Deliberately fall through to scan_for_new_signal() below in
-                # this SAME run, rather than return -- a stale signal being
-                # discarded shouldn't cost this run its chance to catch a
-                # genuine fresh crossover on today's real leg_pairs.
-            else:
-                manage_pending_signal(state, instruments, expiry, smart_api, prev_day, prev_day_cache, today_start, run_candle_cache)
-                save_state(state)
-                save_prev_day_cache(prev_day, prev_day_cache)
-                return
+                # FIX (2026-07-24): validate the resting signal actually belongs
+                # to TODAY's currently-locked leg_pairs before trusting it --
+                # see _pending_signal_matches_locked_legs() docstring above for
+                # the full root-cause writeup. A mismatch means this
+                # pending_signal is stale (left over from an earlier ATM lock
+                # that was never cleared) and must be discarded, never filled.
+                if not _pending_signal_matches_locked_legs(pending, leg_pairs):
+                    print(
+                        f"[STALE PENDING_SIGNAL] {pending.get('sell_symbol', '?')} "
+                        f"(sell_strike={pending.get('sell_strike')}, option_type={pending.get('option_type')}) "
+                        f"does not match any leg in today's locked leg_pairs ({leg_pairs}) -- "
+                        "discarding without filling or managing it, and continuing to scan fresh this run.",
+                        file=sys.stderr,
+                    )
+                    state["pending_signal"] = None
+                    # Deliberately fall through to scan_for_new_signal() below in
+                    # this SAME run, rather than return -- a stale signal being
+                    # discarded shouldn't cost this run its chance to catch a
+                    # genuine fresh crossover on today's real leg_pairs.
+                else:
+                    manage_pending_signal(state, instruments, expiry, smart_api, prev_day, prev_day_cache, today_start, run_candle_cache)
+                    save_state(state)
+                    save_prev_day_cache(prev_day, prev_day_cache)
+                    # UNCHANGED (2026-07-31): still returns here, deliberately
+                    # NOT given the same fall-through treatment as the open-
+                    # position branch above. Reason: _strike_has_open_sell_position()
+                    # (the guard scan_for_new_buy_signal_live() relies on) only
+                    # checks state["open_position"] -- it has no equivalent check
+                    # for a resting, not-yet-filled state["pending_signal"]. If
+                    # this fell through too, the buy scanner could open a
+                    # position on the exact same strike sell has an unfilled
+                    # resting SELL limit on, with nothing currently guarding
+                    # against that specific overlap. Left as a known follow-up,
+                    # not bundled into this fix.
+                    return
 
-        # ---- No position, no (valid) pending signal: scan for a fresh entry trigger ----
-        scan_for_new_signal(state, leg_pairs, instruments, expiry, smart_api, prev_day, prev_day_cache, today_start, run_candle_cache)
+            # ---- No position, no (valid) pending signal: scan for a fresh entry trigger ----
+            scan_for_new_signal(state, leg_pairs, instruments, expiry, smart_api, prev_day, prev_day_cache, today_start, run_candle_cache)
 
-        # ---- Buy-side signal scanning/pending management: only reached ----
-        # ---- when the sell side had nothing to do this run (Pragnesh's ----
-        # ---- call: acceptable to skip on runs where sell is busy -- the ----
-        # ---- entry-condition overlap this would miss is rare outside ----
-        # ---- choppy markets, unlike an OPEN buy position, which is always ----
-        # ---- checked above regardless of the sell branch taken this run). ----
+        # ---- Buy-side signal scanning/pending management ----
+        # UPDATED (2026-07-31): previously only reached when sell had NO
+        # open position and no valid pending signal this run. Now also
+        # reached when sell DOES have an open position (see the FIX note
+        # in the open-position branch above for why) -- scan_for_new_buy_signal_live()'s
+        # own per-strike guard handles the actual same-strike exclusion.
+        # Still NOT reached when sell has a valid resting pending_signal
+        # (that branch still returns early -- see its own note above for
+        # why that case is intentionally left alone for now).
         if state.get("pending_buy_signal") is not None:
             manage_pending_buy_signal_live(state, instruments, expiry, smart_api, prev_day, prev_day_cache, today_start, run_candle_cache)
         else:
