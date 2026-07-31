@@ -40,6 +40,7 @@ import sys
 from config import BUY_PENDING_SIGNAL_MAX_CANDLES, BUY_TARGET_RISK_REWARD
 from calendar_utils import now_ist
 from pending import round_to_half
+from indicators import compute_squeeze_metrics
 
 
 def _condition_holds_buy(row):
@@ -219,20 +220,34 @@ def scan_for_new_buy_signal(candles_by_symbol, compute_indicators_fn, log=True):
             qty = leg_info.get("lot_size", leg_info.get("qty"))
             pending = compute_pending_buy_signal(trigger_candle, leg_info, qty, prev_candle)
             if log:
+                # NEW (2026-07-30, squeeze diagnostics): log spread_pct /
+                # spread-to-ATR on the actual trigger candle for every
+                # fired signal too, not just no-fire scans -- this is the
+                # data we need later to check "did signals that got
+                # stopped out disproportionately have a tight spread_pct
+                # or spread_atr_ratio here". No gating yet, see
+                # indicators.compute_squeeze_metrics() docstring.
+                _, spread_pct, spread_atr_ratio = compute_squeeze_metrics(df.iloc[-1])
+                ratio_str = f"{spread_atr_ratio:.2f}" if spread_atr_ratio is not None else "n/a"
                 print(
                     f"PENDING BUY SIGNAL: BUY {pending['buy_symbol']} resting limit @ "
                     f"{pending['entry_limit']:.2f} (SL={pending['sl_price']:.2f}, "
-                    f"target={pending['target_price']:.2f})"
+                    f"target={pending['target_price']:.2f}) "
+                    f"[squeeze diag: spread_pct={spread_pct:.3f}% spread/atr={ratio_str}]"
                 )
             return pending
         elif log:
             last = df.iloc[-1]
+            _, spread_pct, spread_atr_ratio = compute_squeeze_metrics(last)
+            ratio_str = f"{spread_atr_ratio:.2f}" if spread_atr_ratio is not None else "n/a"
             print(
                 f"[buy scan] {leg_info.get('symbol', '?')}: ema5={last['ema5']:.2f} "
                 f"ema25={last['ema25']:.2f} vwap={last['vwap']:.2f} "
                 f"ema25<ema5={bool(last['ema25'] < last['ema5'])} "
                 f"ema25<vwap={bool(last['ema25'] < last['vwap'])} "
-                f"ema5>vwap={bool(last['ema5'] > last['vwap'])} -- no fresh cross.",
+                f"ema5>vwap={bool(last['ema5'] > last['vwap'])} "
+                f"[squeeze diag: spread_pct={spread_pct:.3f}% spread/atr={ratio_str}] "
+                "-- no fresh cross.",
                 file=sys.stderr,
             )
 
@@ -378,6 +393,20 @@ def scan_for_new_buy_signal_live(state, leg_pairs, instruments, expiry, smart_ap
         if df is None:
             continue
 
+        # NEW (2026-07-30, squeeze diagnostics): log spread_pct /
+        # spread-to-ATR for this strike's latest candle on every live
+        # run, fire or no-fire -- this loop runs against real paper-mode
+        # data, so it's the actual source for calibrating squeeze
+        # thresholds later. No gating yet, see
+        # indicators.compute_squeeze_metrics() docstring.
+        _, spread_pct, spread_atr_ratio = compute_squeeze_metrics(df.iloc[-1])
+        ratio_str = f"{spread_atr_ratio:.2f}" if spread_atr_ratio is not None else "n/a"
+        print(
+            f"[buy scan] {option_type} {strike}: "
+            f"[squeeze diag: spread_pct={spread_pct:.3f}% spread/atr={ratio_str}]",
+            file=sys.stderr,
+        )
+
         if is_fresh_crossover_signal_buy(df):
             trigger_candle = df.iloc[-1].to_dict()
             prev_candle = df.iloc[-2].to_dict()
@@ -387,7 +416,8 @@ def scan_for_new_buy_signal_live(state, leg_pairs, instruments, expiry, smart_ap
             state["pending_buy_signal"] = compute_pending_buy_signal(trigger_candle, leg_info, qty, prev_candle)
             p = state["pending_buy_signal"]
             print(f"PENDING BUY SIGNAL: BUY {p['buy_symbol']} resting limit @ {p['entry_limit']:.2f} "
-                  f"(SL={p['sl_price']:.2f}, target={p['target_price']:.2f})")
+                  f"(SL={p['sl_price']:.2f}, target={p['target_price']:.2f}) "
+                  f"[squeeze diag: spread_pct={spread_pct:.3f}% spread/atr={ratio_str}]")
             return
 
     print("No buy entry signal this run.")
