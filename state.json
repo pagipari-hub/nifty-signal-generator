@@ -1,6 +1,6 @@
 {
   "open_position": null,
-  "last_run": "2026-08-05T11:01:00.910884+05:30",
+  "last_run": "2026-08-05T11:05:41.338675+05:30",
   "heartbeat_date": "2026-08-05",
   "daily_strikes_date": "2026-08-05",
   "daily_atm": 24600,
@@ -29,7 +29,7 @@
     "sl_price": 80.0,
     "target_price": 53.0,
     "trigger_time": "2026-08-05T11:00:51.070445+05:30",
-    "candles_waited": 0,
+    "candles_waited": 1,
     "hedge_entry_price": 18.85
   },
   "pending_buy_signal": {
