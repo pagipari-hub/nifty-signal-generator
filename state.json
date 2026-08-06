@@ -1,18 +1,18 @@
 {
   "open_position": null,
-  "last_run": "2026-08-06T09:25:38.250621+05:30",
+  "last_run": "2026-08-06T09:31:09.828814+05:30",
   "heartbeat_date": "2026-08-06",
-  "daily_strikes_date": "2026-08-05",
-  "daily_atm": 24600,
+  "daily_strikes_date": "2026-08-06",
+  "daily_atm": 24650,
   "daily_strikes": [
     {
-      "sell_strike": 24500,
-      "hedge_strike": 24200,
+      "sell_strike": 24550,
+      "hedge_strike": 24250,
       "option_type": "PE"
     },
     {
-      "sell_strike": 24700,
-      "hedge_strike": 25000,
+      "sell_strike": 24750,
+      "hedge_strike": 25050,
       "option_type": "CE"
     }
   ],
