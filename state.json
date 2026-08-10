@@ -1,6 +1,6 @@
 {
   "open_position": null,
-  "last_run": "2026-08-10T10:35:57.094260+05:30",
+  "last_run": "2026-08-10T10:40:40.340873+05:30",
   "heartbeat_date": "2026-08-10",
   "daily_strikes_date": "2026-08-10",
   "daily_atm": 24550,
@@ -16,22 +16,7 @@
       "option_type": "CE"
     }
   ],
-  "pending_signal": {
-    "sell_symbol": "NIFTY18AUG2624450PE",
-    "sell_token": "45109",
-    "sell_strike": 24450,
-    "hedge_symbol": "NIFTY18AUG2624150PE",
-    "hedge_token": "45097",
-    "hedge_strike": 24150,
-    "option_type": "PE",
-    "qty": 65,
-    "entry_limit": 109.5,
-    "sl_price": 116.5,
-    "target_price": 95.5,
-    "trigger_time": "2026-08-10T10:21:24.825744+05:30",
-    "candles_waited": 2,
-    "hedge_entry_price": 37.6
-  },
+  "pending_signal": null,
   "pending_buy_signal": null,
   "open_buy_position": null
 }
