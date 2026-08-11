@@ -1,6 +1,6 @@
 {
   "open_position": null,
-  "last_run": "2026-08-11T10:15:44.633224+05:30",
+  "last_run": "2026-08-11T10:21:29.446390+05:30",
   "heartbeat_date": "2026-08-11",
   "daily_strikes_date": "2026-08-11",
   "daily_atm": 24500,
@@ -17,18 +17,15 @@
     }
   ],
   "pending_signal": null,
-  "pending_buy_signal": {
-    "buy_symbol": "NIFTY18AUG2624400PE",
-    "buy_token": "45107",
+  "pending_buy_signal": null,
+  "open_buy_position": {
+    "symbol": "NIFTY18AUG2624400PE",
+    "token": "45107",
     "strike": 24400,
     "option_type": "PE",
     "qty": 65,
-    "entry_limit": 101.5,
+    "entry_price": 101.5,
     "sl_price": 99.5,
-    "target_price": 105.5,
-    "risk": 2.0,
-    "trigger_time": "2026-08-11T09:40:54.338595+05:30",
-    "candles_waited": 0
-  },
-  "open_buy_position": null
+    "target_price": 105.5
+  }
 }
