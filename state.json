@@ -1,6 +1,25 @@
 {
-  "open_position": null,
-  "last_run": "2026-08-12T14:51:01.619205+05:30",
+  "open_position": {
+    "spread": true,
+    "option_type": "PE",
+    "sell_leg": {
+      "symbol": "NIFTY18AUG2624350PE",
+      "token": "45105",
+      "strike": 24350
+    },
+    "hedge_leg": {
+      "symbol": "NIFTY18AUG2624050PE",
+      "token": "45093",
+      "strike": 24050
+    },
+    "qty": 65,
+    "entry_price": 104.0,
+    "hedge_entry_price": 25.95,
+    "sl_price": 112.0,
+    "target_price": 88.0,
+    "entry_time": "2026-08-12T14:56:00.465125+05:30"
+  },
+  "last_run": "2026-08-12T14:56:00.465153+05:30",
   "heartbeat_date": "2026-08-12",
   "daily_strikes_date": "2026-08-12",
   "daily_atm": 24450,
@@ -16,22 +35,7 @@
       "option_type": "CE"
     }
   ],
-  "pending_signal": {
-    "sell_symbol": "NIFTY18AUG2624350PE",
-    "sell_token": "45105",
-    "sell_strike": 24350,
-    "hedge_symbol": "NIFTY18AUG2624050PE",
-    "hedge_token": "45093",
-    "hedge_strike": 24050,
-    "option_type": "PE",
-    "qty": 65,
-    "entry_limit": 104.0,
-    "sl_price": 112.0,
-    "target_price": 88.0,
-    "trigger_time": "2026-08-12T14:50:53.218715+05:30",
-    "candles_waited": 0,
-    "hedge_entry_price": 25.95
-  },
+  "pending_signal": null,
   "pending_buy_signal": null,
   "open_buy_position": null
 }
