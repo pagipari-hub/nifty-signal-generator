@@ -10,6 +10,7 @@ from market_data import get_candles_with_cache
 from indicators import compute_indicators, compute_squeeze_metrics
 from logging_utils import log_signal_debug
 from config import SELL_SQUEEZE_SPREAD_ATR_MIN
+from calendar_utils import is_before_sell_scan_cutoff
 
 # NOTE: compute_pending_signal is imported lazily inside
 # scan_for_new_signal() below, not at module level. pending.py's
@@ -119,6 +120,16 @@ def scan_for_new_signal(state, leg_pairs, instruments, expiry, smart_api, prev_d
     [squeeze diag] line) already runs unconditionally above this check,
     for every leg scanned, fired or not -- this gate only affects
     whether a fired crossover is allowed to become a pending_signal.
+
+    NEW (2026-08-13, sell-side scan cutoff): a fresh crossover at/after
+    14:55 IST (config.SELL_SCAN_CUTOFF_TIME) is also blocked from
+    creating a new pending_signal -- checked first, before the squeeze
+    gate, since it's a cheap time check. Same continue-not-return
+    behavior. Does NOT affect an already-resting pending_signal or an
+    already-open sell position -- those are managed elsewhere
+    (pending.manage_pending_signal(), position.py) and keep running
+    every run regardless of this cutoff, right up to the existing
+    EOD_SQUAREOFF handling.
     """
     from pending import compute_pending_signal  # local import -- see NOTE at top of file
 
@@ -138,6 +149,20 @@ def scan_for_new_signal(state, leg_pairs, instruments, expiry, smart_api, prev_d
         log_signal_debug(sell_token_info["symbol"], df)
 
         if is_fresh_crossover_signal(df):
+            # NEW (2026-08-13, sell-side scan cutoff): checked first --
+            # cheapest check, no computation needed -- before the squeeze
+            # gate below. A fresh crossover at/after 14:55 does not
+            # create a new pending_signal; an already-resting or
+            # already-open sell position is untouched by this (see
+            # calendar_utils.is_before_sell_scan_cutoff()'s docstring).
+            if not is_before_sell_scan_cutoff():
+                print(
+                    f"SELL signal on {sell_token_info['symbol']} blocked -- past sell scan "
+                    "cutoff (14:55). Continuing to next leg this run.",
+                    file=sys.stderr,
+                )
+                continue
+
             # NEW (2026-08-12, sell-side squeeze gate): check BEFORE
             # resolving the hedge token / fetching hedge LTP, so a
             # squeeze-blocked leg doesn't waste those calls. None means
