@@ -102,6 +102,18 @@ BUY_SCAN_WINDOWS = [
     (dt.time(13, 30), dt.time(14, 45)),
 ]
 
+# NEW (2026-08-13, sell-side scan cutoff): Pragnesh's call -- new SELL
+# signal scanning (scan_for_new_signal()) stops after this time. Does
+# NOT affect managing an already-resting pending_signal or an
+# already-open sell position -- those keep being monitored every run
+# regardless of time, same reasoning as the buy side's scan window and
+# the existing EOD_SQUAREOFF handling. Intentionally distinct from
+# EOD_SQUAREOFF (15:20) -- this is an earlier, separate cutoff on NEW
+# entries only, leaving a ~25min buffer before EOD square-off where no
+# fresh spread gets initiated but existing ones still get managed
+# normally.
+SELL_SCAN_CUTOFF_TIME = dt.time(14, 55)
+
 # NEW (2026-07-31): buy-side counterpart to the two constants above --
 # same threshold/pct (Pragnesh's call), applied in the opposite direction
 # since buy's SL sits BELOW entry, not above. See
