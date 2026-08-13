@@ -70,6 +70,38 @@ LOW_PREMIUM_SL_THRESHOLD = 99    # Rs. -- below this, SL floor kicks in
 LOW_PREMIUM_SL_MIN_PCT = 0.10    # SL floor = entry_limit * (1 + this)
 TARGET_RISK_REWARD = 2           # target = entry - RR * (SL - entry)
 
+# NEW (2026-08-12, sell-side squeeze gate): a fresh sell crossover is
+# blocked -- not entered -- if spread_atr_ratio (see
+# indicators.compute_squeeze_metrics()) on the trigger candle is below
+# this cutoff. Pragnesh's call, 2026-08-12: sell-side ONLY (buy side
+# stays squeeze-free by design, gated on time-of-day instead -- see
+# BUY_SCAN_WINDOWS below). Picked as a hard threshold, not shadow-mode,
+# per Pragnesh's explicit choice on 2026-08-12 -- single real data point
+# behind it so far (0.017 on the 2026-07-30 NIFTY04AUG2624350CE whipsaw
+# case study in logging_utils.py's docstring); revisit once more
+# paper-mode sell-side squeeze data accumulates. Diagnostics themselves
+# (log_signal_debug's [squeeze diag] line) remain UNCONDITIONAL -- this
+# constant only affects the entry decision, not what gets logged.
+SELL_SQUEEZE_SPREAD_ATR_MIN = 0.5
+
+# NEW (2026-08-12, buy-side scan time windows): Pragnesh's call, same
+# session as the sell-side squeeze gate above -- buy side stays
+# squeeze-free by design (buy signals are the lagged EMA5/VWAP
+# confirmation of a move that's already partly played out, per
+# BUY_ENGINE_INTEGRATION.md section 1 -- squeeze filtering doesn't apply
+# the same way here), but is instead restricted to two intraday windows
+# for NEW signal scanning only. Excludes the 11:45-13:30 midday lull and
+# anything after 14:45. Does NOT apply to managing an already-resting
+# pending_buy_signal or an already-open open_buy_position -- those keep
+# being monitored every run regardless of time, same as the sell side's
+# always-run reasoning for open positions (see
+# BUY_ENGINE_INTEGRATION.md section 4). Diagnostic squeeze logging in
+# buy_signal_engine.py remains unconditional, unaffected by this window.
+BUY_SCAN_WINDOWS = [
+    (dt.time(9, 30), dt.time(11, 45)),
+    (dt.time(13, 30), dt.time(14, 45)),
+]
+
 # NEW (2026-07-31): buy-side counterpart to the two constants above --
 # same threshold/pct (Pragnesh's call), applied in the opposite direction
 # since buy's SL sits BELOW entry, not above. See
