@@ -461,6 +461,31 @@ def fetch_5min_candles(smart_api, token, start_time=None, end_time=None, lookbac
     unaffected) lets prev-day fetches be explicitly bounded to the
     previous day's own close, so they can never again bleed into the
     current run's live candles.
+
+    FIX (2026-08-13, stale-todate-across-retries root cause -- missing
+    entry candle): when end_time is None ("fetch up to now", i.e. every
+    live today-candle fetch), `todate` was still only computed ONCE,
+    before PRE_CALL_DELAY_SECONDS and before _call_with_retry()'s own
+    backoff loop. _rate_limit_backoff_delay() is exponential (5s, 10s,
+    20s, 40s+jitter) -- a couple of rate-limit retries can burn 30-75+
+    seconds. The retry then SUCCEEDS (no exception, no error log), so
+    nothing downstream flags a problem -- but the `todate` it asked for
+    was frozen at the pre-backoff timestamp. If the entry/trigger
+    candle's 5-min window only closed DURING that backoff wait, Angel
+    One was never even asked for it: the fetch "succeeds" against a
+    stale window, silently short of the newest candle. Confirmed
+    2026-08-13: a rate-limit backoff on a live run coincided with the
+    run's own entry candle being absent from the fetched series even
+    though the call itself reported success.
+
+    Fix: when end_time was not explicitly passed, `todate` is now
+    recomputed fresh on EVERY attempt inside _call_with_retry (including
+    the first), not calculated once upfront -- so a late-succeeding
+    retry asks for data up through the actual current time, not the
+    pre-backoff one. `start`/`fromdate` is deliberately NOT recomputed
+    per attempt (only the upper bound caused the missing-candle bug).
+    When end_time WAS explicitly passed (the prev-day bounded fetch),
+    behaviour is unchanged -- that end never moves.
     """
     # DEBUG (temporary -- investigating possible timezone mismatch): `now`
     # here is dt.datetime.now(), i.e. whatever timezone the process's
@@ -472,16 +497,25 @@ def fetch_5min_candles(smart_api, token, start_time=None, end_time=None, lookbac
     # Not changing behavior yet -- logging both clocks so this can be
     # confirmed or ruled out from a live run's output first.
     now = dt.datetime.now()
+    end_is_now = end_time is None
     end = end_time if end_time is not None else now
     start = start_time if start_time is not None else end - dt.timedelta(minutes=lookback_minutes)
 
-    params = {
-        "exchange": "NFO",
-        "symboltoken": token,
-        "interval": "FIVE_MINUTE",
-        "fromdate": start.strftime("%Y-%m-%d %H:%M"),
-        "todate": end.strftime("%Y-%m-%d %H:%M"),
-    }
+    def _build_params():
+        # See FIX (2026-08-13) above: only re-anchor `todate` to the
+        # current wall-clock time when the caller wanted "up to now" in
+        # the first place. An explicit end_time (prev-day fetch) stays
+        # fixed no matter how many attempts this takes.
+        current_end = dt.datetime.now() if end_is_now else end
+        return {
+            "exchange": "NFO",
+            "symboltoken": token,
+            "interval": "FIVE_MINUTE",
+            "fromdate": start.strftime("%Y-%m-%d %H:%M"),
+            "todate": current_end.strftime("%Y-%m-%d %H:%M"),
+        }
+
+    params = _build_params()
 
     print(
         f"[DEBUG] fetch_5min_candles token={token} "
@@ -492,10 +526,15 @@ def fetch_5min_candles(smart_api, token, start_time=None, end_time=None, lookbac
 
     time.sleep(PRE_CALL_DELAY_SECONDS)
 
+    def _do_call():
+        nonlocal params
+        params = _build_params()
+        return smart_api.getCandleData(params)
+
     try:
         response = _call_with_retry(
             "fetch_5min_candles",
-            lambda: smart_api.getCandleData(params),
+            _do_call,
         )
     except DataException as e:
         print(f"Candle fetch failed for token {token} after retries: {e}", file=sys.stderr)
