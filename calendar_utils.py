@@ -4,7 +4,7 @@ IST clock, NSE trading-day/holiday logic, and weekly-expiry resolution.
 
 import datetime as dt
 
-from config import IST, NSE_HOLIDAYS_2026, MARKET_OPEN, MARKET_CLOSE, EOD_SQUAREOFF, BUY_SCAN_WINDOWS
+from config import IST, NSE_HOLIDAYS_2026, MARKET_OPEN, MARKET_CLOSE, EOD_SQUAREOFF, BUY_SCAN_WINDOWS, SELL_SCAN_CUTOFF_TIME
 
 
 def now_ist():
@@ -31,6 +31,21 @@ def is_market_open_now():
 
 def is_eod_squareoff_time():
     return now_ist().time() >= EOD_SQUAREOFF
+
+
+def is_before_sell_scan_cutoff(t=None):
+    """
+    NEW (2026-08-13): is the given time (defaults to now_ist().time())
+    still before config.SELL_SCAN_CUTOFF_TIME (14:55)? Used only to gate
+    NEW sell signal scanning (signal_engine.scan_for_new_signal()) --
+    deliberately NOT used to gate management of an already-resting
+    pending_signal or an already-open sell position, both of which must
+    keep being checked every run regardless of time of day, right up to
+    the existing EOD_SQUAREOFF handling elsewhere.
+    """
+    if t is None:
+        t = now_ist().time()
+    return t < SELL_SCAN_CUTOFF_TIME
 
 
 def is_within_buy_scan_window(t=None):
