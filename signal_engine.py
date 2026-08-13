@@ -7,8 +7,9 @@ import sys
 
 import angelone_client as ac
 from market_data import get_candles_with_cache
-from indicators import compute_indicators
+from indicators import compute_indicators, compute_squeeze_metrics
 from logging_utils import log_signal_debug
+from config import SELL_SQUEEZE_SPREAD_ATR_MIN
 
 # NOTE: compute_pending_signal is imported lazily inside
 # scan_for_new_signal() below, not at module level. pending.py's
@@ -105,6 +106,19 @@ def scan_for_new_signal(state, leg_pairs, instruments, expiry, smart_api, prev_d
     function that usually fetches a sell-strike token FIRST each run, so
     it's typically what populates run_cache for the buy engine
     (scan_for_new_buy_signal_live()) to reuse afterward on the same run.
+
+    NEW (2026-08-12, sell-side squeeze gate): a fresh crossover that
+    would otherwise fire is now blocked if the trigger candle's
+    spread_atr_ratio (see indicators.compute_squeeze_metrics()) is below
+    config.SELL_SQUEEZE_SPREAD_ATR_MIN -- Pragnesh's call, sell-side
+    only, hard threshold (not shadow-mode). A blocked leg does NOT
+    return -- the loop continues to the next leg pair this run, since a
+    squeeze-vetoed leg never actually fired and shouldn't consume the
+    single-slot stop-after-first-fire behavior that only applies to a
+    leg that genuinely fires. Diagnostic logging (log_signal_debug's
+    [squeeze diag] line) already runs unconditionally above this check,
+    for every leg scanned, fired or not -- this gate only affects
+    whether a fired crossover is allowed to become a pending_signal.
     """
     from pending import compute_pending_signal  # local import -- see NOTE at top of file
 
@@ -124,6 +138,23 @@ def scan_for_new_signal(state, leg_pairs, instruments, expiry, smart_api, prev_d
         log_signal_debug(sell_token_info["symbol"], df)
 
         if is_fresh_crossover_signal(df):
+            # NEW (2026-08-12, sell-side squeeze gate): check BEFORE
+            # resolving the hedge token / fetching hedge LTP, so a
+            # squeeze-blocked leg doesn't waste those calls. None means
+            # ATR wasn't available yet (e.g. very start of fetched
+            # history) -- treated as "not enough data to judge squeeze",
+            # so it does NOT block (fail-open, consistent with squeeze
+            # being a diagnostic-first feature elsewhere in the codebase).
+            _, spread_pct, spread_atr_ratio = compute_squeeze_metrics(df.iloc[-1])
+            if spread_atr_ratio is not None and spread_atr_ratio < SELL_SQUEEZE_SPREAD_ATR_MIN:
+                print(
+                    f"SELL signal on {sell_token_info['symbol']} blocked -- squeeze detected "
+                    f"(spread_pct={spread_pct:.3f}%, spread/atr={spread_atr_ratio:.3f} < "
+                    f"{SELL_SQUEEZE_SPREAD_ATR_MIN}). Continuing to next leg this run.",
+                    file=sys.stderr,
+                )
+                continue
+
             hedge_token_info = ac.resolve_option_token(instruments, expiry, leg["hedge_strike"], leg["option_type"])
             if not hedge_token_info:
                 print(f"Signal fired on {sell_token_info['symbol']} but hedge strike "
