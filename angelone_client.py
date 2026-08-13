@@ -93,6 +93,13 @@ SESSION_CACHE_FILE = "angel_session.json"
 # actual test of this renewal path).
 GENERATE_TOKEN_URL = "https://apiconnect.angelone.in/rest/auth/angelbroking/jwt/v1/generateTokens"
 
+# NEW (2026-08-13, WAF/rate-limit diagnostic): Angel One's own historical-
+# candle REST endpoint, hit directly (bypassing the SDK) purely to CAPTURE
+# the raw HTTP status code and headers on a failed candle fetch -- see
+# _diagnostic_probe_raw_candle_response() below for why the SDK itself
+# cannot surface this.
+CANDLE_DATA_URL = "https://apiconnect.angelone.in/rest/secure/angelbroking/historical/v1/getCandleData"
+
 
 def _strip_bearer_prefix(token):
     """
@@ -234,6 +241,107 @@ def _call_with_retry(label, func, attempts=RATE_LIMIT_RETRY_ATTEMPTS):
                 )
             raise
     raise last_err
+
+
+def _diagnostic_probe_raw_candle_response(smart_api, params):
+    """
+    NEW (2026-08-13, WAF/rate-limit root-cause diagnostic -- DIAGNOSTIC
+    ONLY, never used for real candle data, never changes retry behavior
+    or what fetch_5min_candles() returns).
+
+    Root cause of why we've been blind to this: the smartapi-python SDK's
+    own _request() method (confirmed by reading the installed package's
+    source, smartConnect.py) catches a non-JSON response like this:
+
+        try:
+            data = json.loads(r.content.decode("utf8"))
+        except ValueError:
+            raise ex.DataException(
+                "Couldn't parse the JSON response received from the "
+                "server: {content}".format(content=r.content))
+
+    -- it passes through r.content (the raw body text) but NEVER
+    r.status_code or r.headers. Those are simply discarded before the
+    exception ever reaches our code. So "Couldn't parse the JSON
+    response...Access denied because of exceeding access rate" could
+    equally be:
+      (a) Angel One's own documented per-key/per-minute rate limit
+          (typically a real, if oddly-formatted, 429-style response), or
+      (b) a WAF/CDN block page (e.g. Cloudflare) responding to the
+          GitHub Actions runner's IP with a generic denial page that
+          happens to also not be JSON --
+    and nothing in our own retry logs can currently tell those apart.
+
+    This function bypasses the SDK entirely and re-issues the exact same
+    request directly via `requests`, purely to capture and log the raw
+    HTTP status code + a curated set of headers (rate-limit headers if
+    genuine Angel One throttling; CDN/WAF signature headers like
+    cf-ray/server if a block page) + a body snippet. It is fired AT MOST
+    ONCE per fetch_5min_candles() call -- only after _call_with_retry()
+    has already exhausted every real attempt and is giving up -- so this
+    adds no extra load during the retry sequence itself (which could
+    otherwise worsen the exact problem being diagnosed).
+
+    Never raises: any failure in the probe itself (missing token,
+    network error, etc.) is logged and swallowed. This must never be
+    able to affect the real fetch's already-decided failure outcome --
+    by the time this is called, fetch_5min_candles() has already decided
+    to return [] regardless of what this probe finds.
+    """
+    api_key = getattr(smart_api, "api_key", None)
+    access_token = getattr(smart_api, "access_token", None)
+    if not api_key or not access_token:
+        print(
+            "[DIAG] raw candle probe skipped -- could not read api_key/access_token "
+            "off the smart_api object.",
+            file=sys.stderr,
+        )
+        return
+
+    access_token = _strip_bearer_prefix(access_token)
+
+    # Headers mirror the SDK's own requestHeaders() + Authorization
+    # construction exactly (see smartConnect.py's _request()), so this
+    # probe is as close as possible to "the exact same request, just
+    # with the raw response visible" rather than a different request
+    # shape that could get a different WAF/rate-limit outcome.
+    headers = {
+        "Content-type": "application/json",
+        "Authorization": f"Bearer {access_token}",
+        "X-ClientLocalIP": "127.0.0.1",
+        "X-ClientPublicIP": "127.0.0.1",
+        "X-MACAddress": "00:00:00:00:00:00",
+        "Accept": "application/json",
+        "X-PrivateKey": api_key,
+        "X-UserType": "USER",
+        "X-SourceID": "WEB",
+    }
+
+    try:
+        resp = requests.post(CANDLE_DATA_URL, headers=headers, json=params, timeout=15)
+    except requests.RequestException as e:
+        print(f"[DIAG] raw candle probe request itself failed: {e!r}", file=sys.stderr)
+        return
+
+    # Curated header allowlist: rate-limit headers (genuine Angel One
+    # throttling would typically carry these) alongside CDN/WAF
+    # signature headers (a block page would typically carry these
+    # instead) -- printing both sets side by side is what actually lets
+    # this distinguish the two theories from a single log line.
+    interesting_keys = (
+        "retry-after", "x-ratelimit-limit", "x-ratelimit-remaining",
+        "x-ratelimit-reset", "cf-ray", "cf-cache-status", "server", "via",
+        "content-type",
+    )
+    interesting_headers = {
+        k: v for k, v in resp.headers.items() if k.lower() in interesting_keys
+    }
+
+    print(
+        f"[DIAG] raw candle probe result: http_status={resp.status_code} "
+        f"headers={interesting_headers} body_snippet={resp.text[:300]!r}",
+        file=sys.stderr,
+    )
 
 
 def login():
@@ -538,6 +646,15 @@ def fetch_5min_candles(smart_api, token, start_time=None, end_time=None, lookbac
         )
     except DataException as e:
         print(f"Candle fetch failed for token {token} after retries: {e}", file=sys.stderr)
+        # NEW (2026-08-13, WAF/rate-limit diagnostic): fire the raw-response
+        # probe ONLY on this specific "not real JSON" signature, and only
+        # here -- after every real retry attempt has already been spent and
+        # failed. See _diagnostic_probe_raw_candle_response() docstring for
+        # why the SDK's own DataException can't tell us this on its own.
+        # `params` here reflects whatever the LAST attempt actually sent
+        # (rebuilt fresh each attempt -- see _build_params() above).
+        if "couldn't parse the json response" in str(e).lower():
+            _diagnostic_probe_raw_candle_response(smart_api, params)
         return []
 
     if not response or not response.get("status"):
