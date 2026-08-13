@@ -78,6 +78,57 @@ def _drop_unclosed_last_candle(df):
     return df
 
 
+def _detect_candle_gaps(df):
+    """
+    NEW (2026-08-13, candle-skip detection -- diagnostic only, does not
+    change behavior or gate any signal).
+
+    Independent safety net alongside the 2026-08-13 fetch_5min_candles()
+    stale-todate-across-retries fix. That fix addresses the specific
+    mechanism confirmed on 2026-08-13 (a rate-limit backoff freezing
+    `todate` before the entry candle closed). This check instead looks
+    at the SYMPTOM directly -- a hole in today's expected 5-min candle
+    sequence -- so it still catches a missing candle from any other
+    cause (a different retry/timing edge case, a genuine Angel One gap,
+    etc.), not just the one root cause already fixed.
+
+    Expects df already restricted to today's CLOSED candles (i.e. call
+    this AFTER the today_mask filter and AFTER
+    _drop_unclosed_last_candle() -- a still-forming last candle is not a
+    gap, it just hasn't closed yet, and would otherwise be a false
+    positive here).
+
+    Walks consecutive today-candle timestamps looking for any step
+    larger than one CANDLE_WINDOW_SECONDS. Logs each detected gap with
+    the missing timestamp(s) implied. Deliberately does NOT drop rows,
+    backfill, or block the signal -- see buy_signal_engine.py's squeeze
+    diagnostics for the same "log first, gate later once real paper-mode
+    frequency is known" pattern. Wrapped defensively, same as
+    _drop_unclosed_last_candle(): a check that can never crash a run
+    managing a live position over a formatting issue.
+    """
+    if df.empty or len(df) < 2:
+        return
+
+    try:
+        times = df["time"].tolist()
+        for prev_t, curr_t in zip(times, times[1:]):
+            gap_seconds = (curr_t - prev_t).total_seconds()
+            if gap_seconds > CANDLE_WINDOW_SECONDS:
+                missing_count = int(gap_seconds // CANDLE_WINDOW_SECONDS) - 1
+                missing_first = prev_t + dt.timedelta(seconds=CANDLE_WINDOW_SECONDS)
+                print(
+                    f"[WARN] _detect_candle_gaps: gap in today's candle sequence -- "
+                    f"prev={prev_t} next={curr_t} gap={gap_seconds:.0f}s "
+                    f"(~{missing_count} candle(s) missing, starting {missing_first}). "
+                    "Not backfilled or blocked -- diagnostic only.",
+                    file=sys.stderr,
+                )
+    except Exception as e:
+        print(f"[DEBUG] _detect_candle_gaps: check failed ({e!r}) -- "
+              "continuing without it.", file=sys.stderr)
+
+
 def compute_indicators(candles):
     df = pd.DataFrame(candles)
     if df.empty:
@@ -131,6 +182,13 @@ def compute_indicators(candles):
     # len(df) < 2 check below (an unclosed candle shouldn't count toward
     # "do we have enough data").
     df = _drop_unclosed_last_candle(df)
+
+    # NEW (2026-08-13, candle-skip detection): diagnostic-only gap check
+    # across today's remaining CLOSED candles -- see _detect_candle_gaps()
+    # docstring above for why this runs here specifically (after the
+    # unclosed-candle drop, so a still-forming last candle is never
+    # mistaken for a gap) and why it doesn't block or alter df.
+    _detect_candle_gaps(df)
 
     if len(df) < 2:
         print(
