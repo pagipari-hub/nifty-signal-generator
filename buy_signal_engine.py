@@ -40,6 +40,7 @@ import sys
 from config import (
     BUY_PENDING_SIGNAL_MAX_CANDLES, BUY_TARGET_RISK_REWARD,
     BUY_LOW_PREMIUM_SL_THRESHOLD, BUY_LOW_PREMIUM_SL_MIN_PCT,
+    BUY_SCAN_WINDOWS,
 )
 from calendar_utils import now_ist
 from pending import round_to_half
@@ -324,7 +325,7 @@ def manage_pending_buy_signal(pending, df, max_candles=BUY_PENDING_SIGNAL_MAX_CA
 # ============================================================================
 
 import angelone_client as ac
-from calendar_utils import is_eod_squareoff_time
+from calendar_utils import is_eod_squareoff_time, is_within_buy_scan_window
 from market_data import get_candles_with_cache
 from indicators import compute_indicators
 from webhook import send_to_webhook, webhook_confirmed_ok
@@ -393,6 +394,15 @@ def scan_for_new_buy_signal_live(state, leg_pairs, instruments, expiry, smart_ap
     series it's given -- so this is purely a scope change in which
     strike/option_type this loop resolves and fetches, not a change to
     any underlying signal logic.
+
+    NEW (2026-08-12, buy-side scan time window): a fresh crossover that
+    would otherwise create a new pending_buy_signal is now blocked
+    outside config.BUY_SCAN_WINDOWS (09:30-11:45, 13:30-14:45) -- see
+    calendar_utils.is_within_buy_scan_window(). Squeeze-diagnostic
+    logging above this check remains unconditional; this gate is
+    time-of-day only, buy side stays squeeze-free by design. A
+    time-blocked leg does NOT return -- loop continues to the next leg
+    this run, same reasoning as the sell-side squeeze gate.
     """
     for leg in leg_pairs:
         strike = leg["sell_strike"]
@@ -426,6 +436,24 @@ def scan_for_new_buy_signal_live(state, leg_pairs, instruments, expiry, smart_ap
         )
 
         if is_fresh_crossover_signal_buy(df):
+            # NEW (2026-08-12, buy-side scan time window): checked here,
+            # AFTER the squeeze diagnostic already printed above (so
+            # diagnostics stay unconditional), but BEFORE a new
+            # pending_buy_signal gets created. Pragnesh's call: buy side
+            # stays squeeze-free by design -- this is a time-of-day gate,
+            # not a squeeze gate. Does not affect an already-resting
+            # pending_buy_signal or already-open open_buy_position (those
+            # are managed elsewhere, unconditionally, every run -- see
+            # calendar_utils.is_within_buy_scan_window()'s docstring).
+            if not is_within_buy_scan_window():
+                print(
+                    f"[buy scan] fresh crossover on {option_type} {strike} outside "
+                    f"allowed scan windows ({BUY_SCAN_WINDOWS}) -- not entering. "
+                    "Continuing to next leg this run.",
+                    file=sys.stderr,
+                )
+                continue
+
             trigger_candle = df.iloc[-1].to_dict()
             prev_candle = df.iloc[-2].to_dict()
             qty = token_info["lot_size"]
