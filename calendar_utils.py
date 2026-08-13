@@ -4,7 +4,7 @@ IST clock, NSE trading-day/holiday logic, and weekly-expiry resolution.
 
 import datetime as dt
 
-from config import IST, NSE_HOLIDAYS_2026, MARKET_OPEN, MARKET_CLOSE, EOD_SQUAREOFF
+from config import IST, NSE_HOLIDAYS_2026, MARKET_OPEN, MARKET_CLOSE, EOD_SQUAREOFF, BUY_SCAN_WINDOWS
 
 
 def now_ist():
@@ -31,6 +31,20 @@ def is_market_open_now():
 
 def is_eod_squareoff_time():
     return now_ist().time() >= EOD_SQUAREOFF
+
+
+def is_within_buy_scan_window(t=None):
+    """
+    NEW (2026-08-12): is the given time (defaults to now_ist().time())
+    inside one of config.BUY_SCAN_WINDOWS? Used only to gate NEW buy
+    signal scanning (scan_for_new_buy_signal_live()) -- deliberately NOT
+    used to gate management of an already-resting pending_buy_signal or
+    an already-open open_buy_position, both of which must keep being
+    checked every run regardless of time of day.
+    """
+    if t is None:
+        t = now_ist().time()
+    return any(start <= t <= end for start, end in BUY_SCAN_WINDOWS)
 
 
 def get_current_weekly_expiry():
