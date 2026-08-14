@@ -102,18 +102,6 @@ BUY_SCAN_WINDOWS = [
     (dt.time(13, 30), dt.time(14, 45)),
 ]
 
-# NEW (2026-08-13, sell-side scan cutoff): Pragnesh's call -- new SELL
-# signal scanning (scan_for_new_signal()) stops after this time. Does
-# NOT affect managing an already-resting pending_signal or an
-# already-open sell position -- those keep being monitored every run
-# regardless of time, same reasoning as the buy side's scan window and
-# the existing EOD_SQUAREOFF handling. Intentionally distinct from
-# EOD_SQUAREOFF (15:20) -- this is an earlier, separate cutoff on NEW
-# entries only, leaving a ~25min buffer before EOD square-off where no
-# fresh spread gets initiated but existing ones still get managed
-# normally.
-SELL_SCAN_CUTOFF_TIME = dt.time(14, 55)
-
 # NEW (2026-07-31): buy-side counterpart to the two constants above --
 # same threshold/pct (Pragnesh's call), applied in the opposite direction
 # since buy's SL sits BELOW entry, not above. See
@@ -127,3 +115,36 @@ BUY_LOW_PREMIUM_SL_MIN_PCT = 0.10   # SL floor = entry_limit * (1 - this)
 # buy_signal_engine.py: pending_buy_signal / open_buy_position) ----
 BUY_PENDING_SIGNAL_MAX_CANDLES = 5   # resting window: candles N+1 .. N+5
 BUY_TARGET_RISK_REWARD = 2           # target = entry + RR * (entry - SL)
+
+# NEW (2026-08-13, PDL fallback entry -- SELL side only, both PE and CE
+# legs). Design agreed with Pragnesh: when neither leg's EMA/VWAP
+# crossover fires, a sell entry can instead trigger off that leg's own
+# option premium closing below its previous trading day's low (PDL) --
+# a confirmed-close breakdown, not just an intrabar touch. EMA/VWAP
+# always takes priority on a same-run collision (checked first in
+# signal_engine.scan_for_new_signal()); PDL is the fallback, sharing the
+# SAME single pending_signal/open_position slot per leg (mutually
+# exclusive with an EMA/VWAP signal on that leg, not a second parallel
+# signal). SL/target/low-premium-floor formulas are shared with the
+# existing sell-side constants above (LOW_PREMIUM_SL_THRESHOLD,
+# LOW_PREMIUM_SL_MIN_PCT, TARGET_RISK_REWARD) -- no separate constants
+# needed for those; see pending.compute_pending_signal_pdl().
+#
+# PDL itself is locked ONCE per day, immediately after the 9:30 strike
+# lock (see candle_priming.lock_daily_pdl()), reusing the SAME
+# previous-day candle fetch candle_priming.py already performs for
+# EMA25 warm-up (full prior session, MARKET_OPEN-MARKET_CLOSE) -- zero
+# additional API calls. Because ATM (and therefore which strikes are
+# "today's" sell legs) can shift day to day, a given day's locked strike
+# may have been deep OTM and thinly traded on the PREVIOUS day -- its
+# previous-day low in that case isn't a meaningful support level, just
+# noise from a barely-traded contract. This threshold gates that: if a
+# leg's total previous-day volume (summed across the full session's
+# candles) falls under this, PDL fallback is disabled for that leg for
+# the day (falls back to EMA/VWAP-only, unchanged) rather than trading
+# off an unreliable level. Provisional starting value, NOT yet
+# calibrated against real paper data -- revisit once enough days of
+# actual daily_pdl volume totals have been logged and observed, same
+# "log first, calibrate later" pattern as SELL_SQUEEZE_SPREAD_ATR_MIN
+# above.
+PDL_MIN_PREV_DAY_VOLUME = 50000
