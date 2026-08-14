@@ -102,6 +102,21 @@ BUY_SCAN_WINDOWS = [
     (dt.time(13, 30), dt.time(14, 45)),
 ]
 
+# NEW (2026-08-13, sell-side scan cutoff): mirrors BUY_SCAN_WINDOWS's
+# late-day cutoff but for the sell side -- a fresh sell crossover or PDL
+# breakdown (see PDL_MIN_PREV_DAY_VOLUME below) is not allowed to open a
+# NEW pending_signal at/after this time. Set slightly later than the buy
+# side's 14:45 cutoff (14:55) because a sell entry only needs to clear
+# PENDING_SIGNAL_MAX_CANDLES (5 candles, ~25 min) before EOD_SQUAREOFF
+# (15:20), whereas a filled buy position needs to survive as a live,
+# unmonitored-except-every-5-min position for longer -- so the sell side
+# can safely scan a little closer to the close. Does NOT apply to
+# managing an already-resting pending_signal or an already-open
+# open_position -- those keep being checked every run regardless of time,
+# right up through the existing EOD_SQUAREOFF handling. See
+# calendar_utils.is_before_sell_scan_cutoff().
+SELL_SCAN_CUTOFF_TIME = dt.time(14, 55)
+
 # NEW (2026-07-31): buy-side counterpart to the two constants above --
 # same threshold/pct (Pragnesh's call), applied in the opposite direction
 # since buy's SL sits BELOW entry, not above. See

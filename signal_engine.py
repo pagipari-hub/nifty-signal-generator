@@ -9,7 +9,8 @@ import angelone_client as ac
 from market_data import get_candles_with_cache
 from indicators import compute_indicators, compute_squeeze_metrics
 from logging_utils import log_signal_debug
-from config import SELL_SQUEEZE_SPREAD_ATR_MIN
+from config import SELL_SQUEEZE_SPREAD_ATR_MIN, SELL_SCAN_CUTOFF_TIME
+from calendar_utils import is_before_sell_scan_cutoff
 
 # NOTE: compute_pending_signal is imported lazily inside
 # scan_for_new_signal() below, not at module level. pending.py's
@@ -161,10 +162,28 @@ def scan_for_new_signal(state, leg_pairs, instruments, expiry, smart_api, prev_d
     that leg's PDL wasn't available or failed the quality gate at lock
     time, in which case _is_fresh_pdl_breakdown_signal() always returns
     False and this leg behaves exactly as it did before this feature.
+
+    NEW (2026-08-13, sell-side scan cutoff): a fresh crossover OR a fresh
+    PDL breakdown that would otherwise open a new pending_signal is now
+    blocked at/after config.SELL_SCAN_CUTOFF_TIME (14:55) -- see
+    calendar_utils.is_before_sell_scan_cutoff(). This is a single
+    per-run check (not per-leg -- "now" doesn't change leg to leg within
+    one run), evaluated once up front and reused in both branches below.
+    Same continue-not-return posture as the squeeze gate: a cutoff-
+    blocked leg didn't genuinely fire, so it must not consume the
+    single-slot stop-after-first-fire behavior that only applies to a
+    leg that actually enters. Diagnostic logging (log_signal_debug's
+    line, and the squeeze-diag equivalent on the buy side) is untouched
+    by this -- this gate only affects whether a fired signal is allowed
+    to become a pending_signal, exactly like the squeeze gate above it.
+    Does NOT affect manage_pending_signal() or manage_spread_exit() /
+    manage_legacy_single_leg_exit() -- those are never routed through
+    this function and keep running every cycle regardless of time.
     """
     from pending import compute_pending_signal, compute_pending_signal_pdl  # local import -- see NOTE at top of file
 
     daily_pdl = state.get("daily_pdl") or {}
+    within_sell_scan_cutoff = is_before_sell_scan_cutoff()
 
     for leg in leg_pairs:
         sell_token_info = ac.resolve_option_token(instruments, expiry, leg["sell_strike"], leg["option_type"])
@@ -195,6 +214,15 @@ def scan_for_new_signal(state, leg_pairs, instruments, expiry, smart_api, prev_d
                     f"SELL signal on {sell_token_info['symbol']} blocked -- squeeze detected "
                     f"(spread_pct={spread_pct:.3f}%, spread/atr={spread_atr_ratio:.3f} < "
                     f"{SELL_SQUEEZE_SPREAD_ATR_MIN}). Continuing to next leg this run.",
+                    file=sys.stderr,
+                )
+                continue
+
+            if not within_sell_scan_cutoff:
+                print(
+                    f"SELL signal on {sell_token_info['symbol']} blocked -- at/after "
+                    f"sell scan cutoff ({SELL_SCAN_CUTOFF_TIME}). Continuing to next "
+                    "leg this run.",
                     file=sys.stderr,
                 )
                 continue
@@ -253,6 +281,15 @@ def scan_for_new_signal(state, leg_pairs, instruments, expiry, smart_api, prev_d
             # always has priority on a same-run collision -- see
             # scan_for_new_signal()'s own docstring above).
             pdl = daily_pdl.get(leg["option_type"])
+
+            if not within_sell_scan_cutoff:
+                print(
+                    f"PDL breakdown on {sell_token_info['symbol']} blocked -- at/after "
+                    f"sell scan cutoff ({SELL_SCAN_CUTOFF_TIME}). Continuing to next "
+                    "leg this run.",
+                    file=sys.stderr,
+                )
+                continue
 
             hedge_token_info = ac.resolve_option_token(instruments, expiry, leg["hedge_strike"], leg["option_type"])
             if not hedge_token_info:
