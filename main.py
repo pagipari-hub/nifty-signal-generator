@@ -40,7 +40,7 @@ from buy_signal_engine import (
     scan_for_new_buy_signal_live,
 )
 from webhook import send_heartbeat_if_needed, send_strike_lock_alert
-from candle_priming import prime_candle_cache
+from candle_priming import prime_candle_cache, lock_daily_pdl
 from config import STRIKE_LOCK_TIME
 
 
@@ -162,6 +162,13 @@ def main():
             print(f"Locked today's strikes: ATM={atm} (spot={spot_price_at_lock}) -> {leg_pairs}")
             send_strike_lock_alert(atm, leg_pairs, spot_price_at_lock)
             prime_candle_cache(leg_pairs, instruments, expiry, smart_api, prev_day, prev_day_cache, today_start, run_candle_cache)
+            # NEW (2026-08-13, PDL fallback entry -- sell side only):
+            # locks state["daily_pdl"] once for the day, immediately
+            # after priming -- see candle_priming.lock_daily_pdl()'s own
+            # docstring for why this specific ordering (reads directly
+            # from prev_day_cache, which priming's call just populated
+            # moments earlier in this same run, rather than re-fetching).
+            lock_daily_pdl(state, leg_pairs, instruments, expiry, smart_api, prev_day, prev_day_cache, today_start, run_candle_cache)
 
         save_state(state)
 

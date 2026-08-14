@@ -150,6 +150,82 @@ def compute_pending_signal(trigger_candle, sell_leg_info, hedge_leg_info, qty):
     }
 
 
+def compute_pending_signal_pdl(trigger_candle, sell_leg_info, hedge_leg_info, qty, pdl):
+    """
+    NEW (2026-08-13, PDL fallback entry -- sell side only). Design agreed
+    with Pragnesh: an alternate sell trigger for when EMA/VWAP doesn't
+    fire -- a confirmed CLOSE below that leg's previous-day low (PDL),
+    checked every run from 9:30 onward (see signal_engine.py's
+    scan_for_new_signal(), which checks EMA/VWAP FIRST -- always
+    priority on a same-run collision -- and only falls through to this
+    when EMA/VWAP doesn't fire). Shares the SAME pending_signal/
+    open_position slot as the EMA/VWAP signal (mutually exclusive per
+    leg), not a separate parallel signal.
+
+    entry_limit = the TRIGGER CANDLE'S OWN CLOSE (the breakdown close
+    itself), not a pullback formula -- Pragnesh's call. Rounded to 0.5,
+    same as compute_pending_signal().
+
+    SL = the TRIGGER CANDLE'S OWN HIGH (Pragnesh's call: "entry candle
+    high as SL"), floored at entry_limit * (1 + LOW_PREMIUM_SL_MIN_PCT)
+    when entry_limit is under LOW_PREMIUM_SL_THRESHOLD -- same
+    threshold/pct as the EMA/VWAP sell entries above, reused rather than
+    a separate constant (Pragnesh's call: "RR 1:2 (minimum 10%)" maps
+    directly onto the existing low-premium floor).
+
+    Target = fixed TARGET_RISK_REWARD (1:2) off entry_limit, same
+    formula and same constant as compute_pending_signal().
+
+    Fill check reuses the EXACT SAME mechanic as the EMA/VWAP signal
+    (last["high"] >= entry_limit in manage_pending_signal()) -- no
+    separate fill logic needed, since both are resting SELL limits with
+    the same "a later candle's high reaches the limit" semantics.
+
+    Cancellation: NONE. Pragnesh's own reasoning, confirmed correct:
+    since entry_limit sits right at the breakdown candle's close, any
+    recovery bounce back toward/above PDL is exactly the price action
+    that would satisfy the FILL check first (fill is always checked
+    before cancellation) -- a "cancel if price closes back above PDL"
+    rule would almost never actually fire in practice, since fill wins
+    that race first. So a PDL-sourced pending_signal is fill-or-expire
+    only; manage_pending_signal() skips the EMA/VWAP-based cancellation
+    check entirely for signals carrying "signal_source": "pdl" (see that
+    function's own updated docstring).
+
+    The "pdl" and "signal_source" fields below are purely for logging/
+    audit -- they let a later trade review distinguish "this sell fired
+    off EMA/VWAP" from "this sell fired off a PDL breakdown" without
+    needing to cross-reference timestamps against daily_pdl separately.
+    """
+    entry_limit = round_to_half(trigger_candle["close"])
+
+    sl_price = trigger_candle["high"]
+    if entry_limit < LOW_PREMIUM_SL_THRESHOLD:
+        sl_price = max(sl_price, entry_limit * (1 + LOW_PREMIUM_SL_MIN_PCT))
+    sl_price = round_to_half(sl_price)
+
+    risk = sl_price - entry_limit
+    target_price = round_to_half(entry_limit - TARGET_RISK_REWARD * risk)
+
+    return {
+        "sell_symbol": sell_leg_info["symbol"],
+        "sell_token": sell_leg_info["token"],
+        "sell_strike": sell_leg_info["strike"],
+        "hedge_symbol": hedge_leg_info["symbol"],
+        "hedge_token": hedge_leg_info["token"],
+        "hedge_strike": hedge_leg_info["strike"],
+        "option_type": sell_leg_info["option_type"],
+        "qty": qty,
+        "entry_limit": entry_limit,
+        "sl_price": sl_price,
+        "target_price": target_price,
+        "trigger_time": now_ist().isoformat(),
+        "candles_waited": 0,
+        "signal_source": "pdl",
+        "pdl": pdl,
+    }
+
+
 def manage_pending_signal(state, instruments, expiry, smart_api, prev_day, prev_day_cache, today_start, run_cache=None):
     """
     FIX (2026-07-29, run-level dedup): now accepts run_cache and passes
@@ -266,9 +342,16 @@ def manage_pending_signal(state, instruments, expiry, smart_api, prev_day, prev_
                 "sl_price": pending["sl_price"],
                 "target_price": pending["target_price"],
                 "entry_time": now_ist().isoformat(),
+                # NEW (2026-08-13, PDL fallback entry): carried through onto
+                # the open position too, not just the pending signal -- so
+                # a later exit/P&L review can tell "this trade came from a
+                # PDL breakdown" apart from "this came from EMA/VWAP"
+                # without needing to cross-reference timestamps.
+                "signal_source": pending.get("signal_source", "ema_vwap"),
             }
             state["pending_signal"] = None
-            print(f"FILLED: SELL {pending['sell_symbol']} @ {pending['entry_limit']} "
+            source_tag = " [PDL breakdown]" if pending.get("signal_source") == "pdl" else ""
+            print(f"FILLED: SELL {pending['sell_symbol']} @ {pending['entry_limit']}{source_tag} "
                   f"+ hedge BUY {hedge_token_info['symbol']}, qty={pending['qty']}")
         else:
             print(
@@ -279,7 +362,17 @@ def manage_pending_signal(state, instruments, expiry, smart_api, prev_day, prev_
         return
 
     # ---- 2. Cancellation check: has the original setup invalidated? ----
-    if not check_entry_signal(df):
+    # NEW (2026-08-13, PDL fallback entry): a PDL-sourced pending_signal
+    # (signal_source == "pdl") has NO cancellation check at all -- fill
+    # or expire only. See compute_pending_signal_pdl()'s docstring for
+    # why: entry_limit sits at the breakdown candle's own close, so any
+    # recovery bounce back toward/above PDL is exactly the price action
+    # that would already satisfy the FILL check above (checked first,
+    # every run) -- a separate "cancel if price closes back above PDL"
+    # rule would almost never actually fire in practice, since fill wins
+    # that race first. check_entry_signal() itself is also EMA/VWAP-
+    # specific and has no meaning for a PDL-triggered signal anyway.
+    if pending.get("signal_source") != "pdl" and not check_entry_signal(df):
         print(f"pending_signal for {pending['sell_symbol']} cancelled -- "
               "EMA5/VWAP crossover condition no longer holds.")
         state["pending_signal"] = None
