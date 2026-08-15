@@ -102,6 +102,32 @@ BUY_SCAN_WINDOWS = [
     (dt.time(13, 30), dt.time(14, 45)),
 ]
 
+# NEW (2026-08-14, buy-side squeeze gate -- REVERSES the earlier
+# "buy stays squeeze-free by design" call above). Real paper-mode
+# evidence overturned that assumption: two same-day NIFTY18AUG2624200PE
+# buy trades (11:16 entry, spread_atr_ratio=0.50; 11:36 re-entry,
+# spread_atr_ratio=0.35) both fired cleanly (genuine fresh crossover,
+# setup correctly formed per is_fresh_crossover_signal_buy()) while
+# EMA5/EMA25/VWAP were still tightly bunched, and both were stopped out
+# within 5-14 candles for near-identical losses (-244.03, -243.95) --
+# the same tight-SL-from-tight-bunching mechanism as the sell-side
+# whipsaw case study, just reached via a different path than assumed.
+# The original reasoning (EMA5's lag already filters squeeze-driven
+# noise before a buy signal can fire) turned out not to hold: the lag
+# changes WHICH candle a signal fires on, not whether the three lines
+# are still bunched at that later candle. Pragnesh's call, 2026-08-14:
+# mirror the sell-side threshold/mechanism exactly (same 0.5 cutoff,
+# same hard-gate-not-shadow-mode posture, same continue-not-return
+# behavior) rather than inventing a separate buy-specific value --
+# revisit once more paper-mode buy-side squeeze data accumulates, same
+# as the sell-side constant's own note. Applied only in
+# scan_for_new_buy_signal_live() (the live-wired scan) -- see that
+# function's docstring for placement. Squeeze-diagnostic logging itself
+# (the [squeeze diag] line already printed unconditionally in both the
+# standalone and live buy scans) is unaffected -- this constant only
+# gates the entry decision.
+BUY_SQUEEZE_SPREAD_ATR_MIN = 0.5
+
 # NEW (2026-08-13, sell-side scan cutoff): mirrors BUY_SCAN_WINDOWS's
 # late-day cutoff but for the sell side -- a fresh sell crossover or PDL
 # breakdown (see PDL_MIN_PREV_DAY_VOLUME below) is not allowed to open a

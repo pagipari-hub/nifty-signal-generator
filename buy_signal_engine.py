@@ -40,7 +40,7 @@ import sys
 from config import (
     BUY_PENDING_SIGNAL_MAX_CANDLES, BUY_TARGET_RISK_REWARD,
     BUY_LOW_PREMIUM_SL_THRESHOLD, BUY_LOW_PREMIUM_SL_MIN_PCT,
-    BUY_SCAN_WINDOWS,
+    BUY_SCAN_WINDOWS, BUY_SQUEEZE_SPREAD_ATR_MIN,
 )
 from calendar_utils import now_ist
 from pending import round_to_half
@@ -227,6 +227,22 @@ def scan_for_new_buy_signal(candles_by_symbol, compute_indicators_fn, log=True):
     Only ever returns at most one signal per call, same single-slot
     reasoning as the sell engine (see its docstring on why it stops after
     the first leg that fires).
+
+    NEW (2026-08-14, buy-side squeeze gate): mirrors the sell-side
+    squeeze gate in signal_engine.scan_for_new_signal() -- a fresh
+    crossover that would otherwise return a pending signal is now
+    blocked if spread_atr_ratio on the trigger candle is below
+    config.BUY_SQUEEZE_SPREAD_ATR_MIN. This REVERSES the earlier "buy
+    stays squeeze-free by design" call -- see BUY_SQUEEZE_SPREAD_ATR_MIN's
+    docstring in config.py for the real paper-mode case study that
+    overturned it (2026-08-14, NIFTY18AUG2624200PE, two same-day
+    whipsaw entries at spread_atr_ratio 0.50 and 0.35). Added here (the
+    standalone/backtest scan) as well as in scan_for_new_buy_signal_live()
+    below, so test_buy_signal_engine.py's replay against candle_history/
+    CSVs reflects the same gating live trading now has -- a backtest
+    that silently omitted this gate would no longer represent what the
+    live system actually does. None (ATR not yet available) fails open,
+    same reasoning as the sell-side gate.
     """
     for leg_info, candles in candles_by_symbol.items():
         df = compute_indicators_fn(candles)
@@ -234,6 +250,19 @@ def scan_for_new_buy_signal(candles_by_symbol, compute_indicators_fn, log=True):
             continue
 
         if is_fresh_crossover_signal_buy(df):
+            _, spread_pct, spread_atr_ratio = compute_squeeze_metrics(df.iloc[-1])
+            ratio_str = f"{spread_atr_ratio:.2f}" if spread_atr_ratio is not None else "n/a"
+
+            if spread_atr_ratio is not None and spread_atr_ratio < BUY_SQUEEZE_SPREAD_ATR_MIN:
+                if log:
+                    print(
+                        f"BUY signal on {leg_info.get('symbol', '?')} blocked -- squeeze "
+                        f"detected (spread_pct={spread_pct:.3f}%, spread/atr={ratio_str} < "
+                        f"{BUY_SQUEEZE_SPREAD_ATR_MIN}). Continuing to next leg this scan.",
+                        file=sys.stderr,
+                    )
+                continue
+
             trigger_candle = df.iloc[-1].to_dict()
             prev_candle = df.iloc[-2].to_dict()
             qty = leg_info.get("lot_size", leg_info.get("qty"))
@@ -244,10 +273,9 @@ def scan_for_new_buy_signal(candles_by_symbol, compute_indicators_fn, log=True):
                 # fired signal too, not just no-fire scans -- this is the
                 # data we need later to check "did signals that got
                 # stopped out disproportionately have a tight spread_pct
-                # or spread_atr_ratio here". No gating yet, see
-                # indicators.compute_squeeze_metrics() docstring.
-                _, spread_pct, spread_atr_ratio = compute_squeeze_metrics(df.iloc[-1])
-                ratio_str = f"{spread_atr_ratio:.2f}" if spread_atr_ratio is not None else "n/a"
+                # or spread_atr_ratio here". Diagnostic logging stays
+                # unconditional; BUY_SQUEEZE_SPREAD_ATR_MIN above is what
+                # now actually gates the entry.
                 print(
                     f"PENDING BUY SIGNAL: BUY {pending['buy_symbol']} resting limit @ "
                     f"{pending['entry_limit']:.2f} (SL={pending['sl_price']:.2f}, "
@@ -403,6 +431,31 @@ def scan_for_new_buy_signal_live(state, leg_pairs, instruments, expiry, smart_ap
     time-of-day only, buy side stays squeeze-free by design. A
     time-blocked leg does NOT return -- loop continues to the next leg
     this run, same reasoning as the sell-side squeeze gate.
+
+    NEW (2026-08-14, buy-side squeeze gate -- REVERSES the earlier "buy
+    stays squeeze-free by design" call above and in
+    BUY_ENGINE_INTEGRATION.md section 1). Real paper-mode evidence
+    overturned that assumption: two same-day NIFTY18AUG2624200PE buy
+    trades (11:16 entry, spread_atr_ratio=0.50; 11:36 re-entry,
+    spread_atr_ratio=0.35) both fired as genuine fresh crossovers --
+    setup correctly formed, no bug in the detection logic -- while
+    EMA5/EMA25/VWAP were still tightly bunched at the trigger candle,
+    and both were stopped out within minutes for near-identical losses
+    (-244.03, -243.95). The original reasoning (EMA5's lag already
+    filters squeeze-driven noise before a buy signal can fire) doesn't
+    hold: the lag changes WHICH candle a signal fires on, not whether
+    the three lines are still bunched together at that later candle.
+    Pragnesh's call, 2026-08-14: mirror the sell-side gate exactly (same
+    BUY_SQUEEZE_SPREAD_ATR_MIN=0.5 cutoff value as the sell side's own
+    SELL_SQUEEZE_SPREAD_ATR_MIN, same hard-gate-not-shadow-mode posture,
+    same continue-not-return -- a squeeze-blocked leg didn't genuinely
+    fire, so it must not consume the single-slot stop-after-first-fire
+    behavior). Checked here using the spread_atr_ratio already computed
+    above for the unconditional squeeze-diagnostic log line -- no second
+    computation needed. Checked BEFORE the buy-side scan-window gate
+    below (arbitrary order between two independent O(1) gates; squeeze
+    first only to mirror the sell side's own ordering, which checks
+    squeeze before doing any further per-leg work).
     """
     for leg in leg_pairs:
         strike = leg["sell_strike"]
@@ -436,6 +489,22 @@ def scan_for_new_buy_signal_live(state, leg_pairs, instruments, expiry, smart_ap
         )
 
         if is_fresh_crossover_signal_buy(df):
+            # NEW (2026-08-14, buy-side squeeze gate): see docstring
+            # above for the full case-study writeup. spread_atr_ratio is
+            # already computed above for the unconditional diagnostic
+            # line -- reused here, not recomputed. None (ATR not yet
+            # available, e.g. very start of fetched history) fails open,
+            # same as the sell-side gate's treatment.
+            if spread_atr_ratio is not None and spread_atr_ratio < BUY_SQUEEZE_SPREAD_ATR_MIN:
+                print(
+                    f"[buy scan] fresh crossover on {option_type} {strike} blocked -- "
+                    f"squeeze detected (spread_pct={spread_pct:.3f}%, "
+                    f"spread/atr={spread_atr_ratio:.3f} < {BUY_SQUEEZE_SPREAD_ATR_MIN}). "
+                    "Continuing to next leg this run.",
+                    file=sys.stderr,
+                )
+                continue
+
             # NEW (2026-08-12, buy-side scan time window): checked here,
             # AFTER the squeeze diagnostic already printed above (so
             # diagnostics stay unconditional), but BEFORE a new
