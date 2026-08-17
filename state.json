@@ -20,7 +20,7 @@
     "entry_time": "2026-08-17T09:51:05.117357+05:30",
     "signal_source": "ema_vwap"
   },
-  "last_run": "2026-08-17T10:06:19.605191+05:30",
+  "last_run": "2026-08-17T10:11:03.735834+05:30",
   "heartbeat_date": "2026-08-17",
   "daily_strikes_date": "2026-08-17",
   "daily_atm": 24300,
@@ -48,7 +48,7 @@
     "target_price": 107.0,
     "risk": 9.0,
     "trigger_time": "2026-08-17T10:01:10.854706+05:30",
-    "candles_waited": 1
+    "candles_waited": 2
   },
   "open_buy_position": null,
   "daily_pdl": {
