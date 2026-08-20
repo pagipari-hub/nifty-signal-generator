@@ -1,6 +1,6 @@
 {
   "open_position": null,
-  "last_run": "2026-08-20T11:50:52.518319+05:30",
+  "last_run": "2026-08-20T11:55:40.284253+05:30",
   "heartbeat_date": "2026-08-20",
   "daily_strikes_date": "2026-08-20",
   "daily_atm": 24200,
@@ -28,7 +28,7 @@
     "target_price": 97.0,
     "risk": 8.0,
     "trigger_time": "2026-08-20T11:41:30.716277+05:30",
-    "candles_waited": 2
+    "candles_waited": 3
   },
   "open_buy_position": {
     "symbol": "NIFTY25AUG2624300CE",
