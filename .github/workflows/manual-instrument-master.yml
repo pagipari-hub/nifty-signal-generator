@@ -10,6 +10,11 @@ jobs:
   cache-instrument-master:
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
       - name: Download instrument master
         shell: bash
         run: |
@@ -17,8 +22,14 @@ jobs:
           mkdir -p data
           url="https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
           echo "Downloading Angel One instrument master..."
-          curl -fL --retry 2 --retry-delay 3 --connect-timeout 10 --max-time 120 \
+
+          # Angel's endpoint can stall/reset large HTTP/2 transfers.
+          # Use HTTP/1.1 and retry/resume so a transient interruption does
+          # not throw away the bytes already received.
+          curl --http1.1 -fL --retry 5 --retry-delay 5 --retry-all-errors \
+            --connect-timeout 15 --max-time 600 --continue-at - \
             "$url" -o data/instrument_master.json
+
           test -s data/instrument_master.json
           python - <<'PY'
           import json
@@ -30,19 +41,6 @@ jobs:
           print(f"JSON OK: {len(data):,} instruments")
           PY
           ls -lh data/instrument_master.json
-
-      - name: Commit instrument master to repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
-
-      - name: Move downloaded file into checked-out repository
-        shell: bash
-        run: |
-          set -euo pipefail
-          # The download step ran before checkout, so the file is in the
-          # workspace already; checkout preserves it unless a tracked file exists.
-          test -s data/instrument_master.json
 
       - name: Commit and push
         shell: bash
