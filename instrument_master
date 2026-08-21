@@ -1,0 +1,5 @@
+curl -o instrument_master.json \
+  https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json \
+  --max-time 60
+
+python3 -c "import json; d = json.load(open('instrument_master.json')); print(len(d), 'instruments')"
