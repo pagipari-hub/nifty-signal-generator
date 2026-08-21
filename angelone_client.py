@@ -31,6 +31,19 @@ INSTRUMENT_MASTER_URL = (
 )
 INSTRUMENT_MASTER_CACHE = "instrument_master.json"
 
+# NEW (2026-08-21, instrument-master-timeout root cause): separate from
+# RATE_LIMIT_* below on purpose -- this endpoint stalling mid-response
+# (confirmed 2026-08-21: requests.exceptions.ConnectionError /
+# ReadTimeoutError on margincalculator.angelbroking.com, every run since
+# market open) is a different failure mode from getCandleData's
+# "exceeding access rate" DataException, and doesn't need a 45s-ceiling
+# exponential backoff -- it's called once per run, not per-token, and a
+# long backoff here just burns more of the run's own time budget for no
+# benefit. A short, flat retry is enough to ride out a single stalled
+# response without turning one bad connection into an all-day outage.
+INSTRUMENT_MASTER_RETRY_ATTEMPTS = 2
+INSTRUMENT_MASTER_RETRY_DELAY_SECONDS = 5
+
 # FIX (rate-limit retry rework): the old retry config (3 attempts, flat 3s
 # delay) was tuned as if Angel One only enforced a per-second cap. Their
 # own forum confirms getCandleData also has a per-MINUTE cap (~180/min)
@@ -483,6 +496,58 @@ def login_with_cache():
 
 
 def download_instrument_master(force_refresh=False):
+    """
+    FIX (2026-08-21, all-day-outage root cause): previously a single
+    unprotected requests.get() with no retry and no fallback -- one
+    failure here killed the ENTIRE run before strike lock or any signal
+    logic ever ran, every single time, because a failed fetch was never
+    cached, so every subsequent run repeated the exact same unprotected
+    call.
+
+    Confirmed root cause, 2026-08-21 case study: the first run of the
+    day (09:30 IST) hit a raw requests.exceptions.ConnectionError
+    (ReadTimeoutError under the hood) on
+    margincalculator.angelbroking.com -- NOT a DataException, so
+    _call_with_retry()'s backoff never applied to this call in the first
+    place (that wrapper was only ever used for SmartConnect SDK calls
+    like getCandleData/ltpData, not this plain requests.get()). Because
+    INSTRUMENT_MASTER_CACHE never got written that morning, every run
+    since repeated the identical unprotected fetch and died the same
+    way -- reported as happening "since morning", consistent with this
+    mechanism rather than a one-off blip.
+
+    Checked Angel One's forum/status channels first (2026-08-21) -- no
+    reported outage found for this endpoint. Cause (transient host
+    stall vs. the same IP-reputation pattern already suspected for
+    getCandleData on GH Actions runners) is not distinguishable from
+    this log alone, and isn't something this fix needs to resolve --
+    the actual bug is "one slow response takes down the whole run with
+    no retry and no fallback," which holds regardless of cause.
+
+    Fix, deliberately scoped to just this function:
+      1. Retry the download once on failure (short flat delay --
+         INSTRUMENT_MASTER_RETRY_DELAY_SECONDS -- not the 45s-ceiling
+         exponential backoff used for getCandleData rate-limiting, which
+         is tuned for a different failure mode and would burn too much
+         of a single run's time budget for a once-per-run call).
+      2. If both attempts fail, fall back to WHATEVER instrument_master.json
+         already exists on disk, even if it's from a previous day (stale
+         cache is safe here -- NIFTY's weekly-options instrument list
+         doesn't meaningfully change within a few days; strike/expiry
+         resolution downstream would rather have yesterday's list than
+         no list at all). This is a deliberate loosening of the existing
+         same-day-only freshness check in the normal (non-failure) path
+         above -- that check is UNCHANGED for the happy path; this stale
+         fallback only triggers when a fresh fetch has just failed twice.
+      3. Only raises (and kills the run, same as before) if the download
+         fails AND there is no cached file of any age to fall back to --
+         i.e. the true worst case (first run of the day, endpoint down,
+         nothing to fall back on) is unchanged from before this fix.
+
+    A stale-cache fallback is logged loudly (stderr) every time it's
+    used, so a silently-aging instrument list doesn't go unnoticed for
+    days if the endpoint stays degraded.
+    """
     if not force_refresh and os.path.exists(INSTRUMENT_MASTER_CACHE):
         mtime = dt.datetime.fromtimestamp(os.path.getmtime(INSTRUMENT_MASTER_CACHE))
         if mtime.date() == dt.date.today():
@@ -490,14 +555,51 @@ def download_instrument_master(force_refresh=False):
                 return json.load(f)
 
     print("Downloading fresh instrument master JSON...")
-    resp = requests.get(INSTRUMENT_MASTER_URL, timeout=30)
-    resp.raise_for_status()
-    data = resp.json()
 
-    with open(INSTRUMENT_MASTER_CACHE, "w") as f:
-        json.dump(data, f)
+    last_err = None
+    for attempt in range(1, INSTRUMENT_MASTER_RETRY_ATTEMPTS + 1):
+        try:
+            resp = requests.get(INSTRUMENT_MASTER_URL, timeout=30)
+            resp.raise_for_status()
+            data = resp.json()
 
-    return data
+            with open(INSTRUMENT_MASTER_CACHE, "w") as f:
+                json.dump(data, f)
+
+            return data
+        except (requests.RequestException, ValueError) as e:
+            last_err = e
+            print(
+                f"Instrument master download failed (attempt "
+                f"{attempt}/{INSTRUMENT_MASTER_RETRY_ATTEMPTS}): {e!r}",
+                file=sys.stderr,
+            )
+            if attempt < INSTRUMENT_MASTER_RETRY_ATTEMPTS:
+                time.sleep(INSTRUMENT_MASTER_RETRY_DELAY_SECONDS)
+
+    # Both attempts failed -- fall back to whatever's on disk, even stale,
+    # rather than taking down the whole run over an instrument list that
+    # barely changes day to day.
+    if os.path.exists(INSTRUMENT_MASTER_CACHE):
+        mtime = dt.datetime.fromtimestamp(os.path.getmtime(INSTRUMENT_MASTER_CACHE))
+        print(
+            f"Instrument master download failed after "
+            f"{INSTRUMENT_MASTER_RETRY_ATTEMPTS} attempts ({last_err!r}) -- "
+            f"falling back to STALE cache from {mtime.isoformat()} rather than "
+            "aborting the run. Strike/expiry resolution today is using a "
+            "not-necessarily-fresh instrument list until this endpoint recovers.",
+            file=sys.stderr,
+        )
+        with open(INSTRUMENT_MASTER_CACHE, "r") as f:
+            return json.load(f)
+
+    print(
+        f"Instrument master download failed after "
+        f"{INSTRUMENT_MASTER_RETRY_ATTEMPTS} attempts ({last_err!r}) and no "
+        "cached instrument master exists on disk to fall back to -- aborting.",
+        file=sys.stderr,
+    )
+    raise last_err
 
 
 def resolve_option_token(instruments, expiry_date, strike, option_type):
