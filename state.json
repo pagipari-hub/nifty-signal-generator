@@ -1,26 +1,38 @@
 {
   "open_position": null,
-  "last_run": "2026-08-27T09:25:30.926744+05:30",
+  "last_run": "2026-08-27T09:31:37.692836+05:30",
   "heartbeat_date": "2026-08-27",
-  "daily_strikes_date": "2026-08-26",
-  "daily_atm": 24350,
+  "daily_strikes_date": "2026-08-27",
+  "daily_atm": 24200,
   "daily_strikes": [
     {
-      "sell_strike": 24250,
-      "hedge_strike": 23950,
+      "sell_strike": 24100,
+      "hedge_strike": 23800,
       "option_type": "PE"
     },
     {
-      "sell_strike": 24450,
-      "hedge_strike": 24750,
+      "sell_strike": 24300,
+      "hedge_strike": 24600,
       "option_type": "CE"
     }
   ],
   "pending_signal": null,
-  "pending_buy_signal": null,
+  "pending_buy_signal": {
+    "buy_symbol": "NIFTY01SEP2624100PE",
+    "buy_token": "46990",
+    "strike": 24100,
+    "option_type": "PE",
+    "qty": 65,
+    "entry_limit": 36.0,
+    "sl_price": 32.0,
+    "target_price": 44.0,
+    "risk": 4.0,
+    "trigger_time": "2026-08-27T09:31:37.692808+05:30",
+    "candles_waited": 0
+  },
   "open_buy_position": null,
   "daily_pdl": {
-    "PE": 61.0,
-    "CE": 35.05
+    "PE": 17.35,
+    "CE": 125.3
   }
 }
