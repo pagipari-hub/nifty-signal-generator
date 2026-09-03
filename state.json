@@ -20,7 +20,7 @@
     "entry_time": "2026-09-03T09:55:54.760056+05:30",
     "signal_source": "ema_vwap"
   },
-  "last_run": "2026-09-03T10:16:28.848485+05:30",
+  "last_run": "2026-09-03T10:20:53.540961+05:30",
   "heartbeat_date": "2026-09-03",
   "daily_strikes_date": "2026-09-03",
   "daily_atm": 24000,
@@ -37,19 +37,7 @@
     }
   ],
   "pending_signal": null,
-  "pending_buy_signal": {
-    "buy_symbol": "NIFTY08SEP2624100CE",
-    "buy_token": "42643",
-    "strike": 24100,
-    "option_type": "CE",
-    "qty": 65,
-    "entry_limit": 73.0,
-    "sl_price": 65.5,
-    "target_price": 88.0,
-    "risk": 7.5,
-    "trigger_time": "2026-09-03T09:41:20.571747+05:30",
-    "candles_waited": 4
-  },
+  "pending_buy_signal": null,
   "open_buy_position": null,
   "daily_pdl": {
     "PE": 101.2,
