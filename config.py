@@ -126,6 +126,11 @@ BUY_SCAN_WINDOWS = [
 # (the [squeeze diag] line already printed unconditionally in both the
 # standalone and live buy scans) is unaffected -- this constant only
 # gates the entry decision.
+#
+# UNCHANGED by the 2026-09-04 ROC rework: this gate operates on
+# EMA5/EMA25/VWAP bunching, orthogonal to whatever generates the
+# crossover -- still checked in scan_for_new_buy_signal_live() exactly
+# where it was before (see buy_signal_engine.py's top docstring).
 BUY_SQUEEZE_SPREAD_ATR_MIN = 0.5
 
 # NEW (2026-08-13, sell-side scan cutoff): mirrors BUY_SCAN_WINDOWS's
@@ -149,13 +154,35 @@ SELL_SCAN_CUTOFF_TIME = dt.time(14, 55)
 # buy_signal_engine.compute_pending_buy_signal()'s docstring for why this
 # was missing until now (all 7 paper buy trades to date hit SL, several
 # on sub-Rs.99 premiums, with no floor at all on that side).
+#
+# UNCHANGED by the 2026-09-04 ROC rework -- still applied on top of the
+# new prev-candle-low SL formula, same widen-only contract.
 BUY_LOW_PREMIUM_SL_THRESHOLD = 99   # Rs. -- below this, SL floor kicks in
 BUY_LOW_PREMIUM_SL_MIN_PCT = 0.10   # SL floor = entry_limit * (1 - this)
 
 # ---- Buy-side signal engine (wired into main.py/state.json via
 # buy_signal_engine.py: pending_buy_signal / open_buy_position) ----
 BUY_PENDING_SIGNAL_MAX_CANDLES = 5   # resting window: candles N+1 .. N+5
-BUY_TARGET_RISK_REWARD = 2           # target = entry + RR * (entry - SL)
+
+# NEW (2026-09-04, ROC replacement): entry trigger is now
+# ROC(BUY_ROC_PERIOD) on 5-min candle closes crossing above
+# BUY_ROC_CROSS_LEVEL, with the additional filter that the trigger
+# candle's own close must be above VWAP. Replaces the EMA5/EMA25/VWAP
+# crossover entirely on the buy side -- see buy_signal_engine.py's
+# module docstring and is_fresh_crossover_signal_buy() for the full
+# writeup. Period/level match the TradingView ROC settings Pragnesh
+# shared (Length=18); the "cross above 1" level is Pragnesh's explicit
+# choice, not TradingView's default zero-line cross. Does NOT affect or
+# replace BUY_SQUEEZE_SPREAD_ATR_MIN above -- that gate still applies on
+# top of this new trigger, unchanged.
+BUY_ROC_PERIOD = 18
+BUY_ROC_CROSS_LEVEL = 1.0
+
+# CHANGED (2026-09-04, ROC replacement): target risk:reward tightened
+# from 1:2 to 1:1 as part of the same rework -- Pragnesh's explicit call
+# alongside the new ROC trigger and the new SL formula (prior candle's
+# low, see buy_signal_engine.compute_pending_buy_signal()). Was 2.
+BUY_TARGET_RISK_REWARD = 1           # target = entry + RR * (entry - SL)
 
 # NEW (2026-08-13, PDL fallback entry -- SELL side only, both PE and CE
 # legs). Design agreed with Pragnesh: when neither leg's EMA/VWAP
