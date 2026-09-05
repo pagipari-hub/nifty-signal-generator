@@ -15,33 +15,33 @@ VWAP crossover to an ROC-based trigger, per Pragnesh's explicit spec:
     -- still a pullback entry, same fill mechanics as before.
 
 SL = LOW of the candle immediately BEFORE the trigger candle (candle
-N-1) -- no longer min(low, vwap) on the trigger candle itself. The
+N-1) -- no longer min(low, vwap) on the trigger candle itself.
+prev_candle is now a REQUIRED argument to compute_pending_buy_signal()
+(was optional before), since is_fresh_crossover_signal_buy() already
+requires df.iloc[-2] to exist for the ROC-cross check itself. The
 low-premium SL floor (Rs.99 / 10%, config.BUY_LOW_PREMIUM_SL_THRESHOLD /
-BUY_LOW_PREMIUM_SL_MIN_PCT) is REINSTATED on top of this new SL --
-widen-only, same as before, same as the sell side's own version.
+BUY_LOW_PREMIUM_SL_MIN_PCT) is UNCHANGED -- still applied on top, still
+widen-only.
 
-Target = entry + BUY_TARGET_RISK_REWARD * (entry - SL), fixed 1:1 by
-default (config.BUY_TARGET_RISK_REWARD, changed from 1:2 to 1:1 as part
-of this same rework).
+Target = entry + BUY_TARGET_RISK_REWARD * (entry - SL) -- RR changed
+from 1:2 to 1:1 as part of this same rework (config.BUY_TARGET_RISK_REWARD).
 
-Same-strike guard REMOVED (2026-09-04): a buy signal used to be skipped
-if the sell side already had an open position on that exact strike
-(_strike_has_open_sell_position(), now deleted). Pragnesh's explicit
-call: the buy side should fire independent of whatever the sell side is
-doing, since a long option's downside is capped at the premium paid --
-low enough cost that the same-strike overlap risk this guard was
-protecting against is no longer worth the missed signals it was
-blocking. Run-order gating in main.py (buy scanning only runs when sell
-has nothing to do that run) and the single-slot pending_buy_signal /
-open_buy_position limit are UNCHANGED -- only the same-strike check
-itself was removed, not the surrounding run-order structure.
+IMPORTANT -- what this rework does NOT touch: the 2026-08-14 buy-side
+squeeze gate (config.BUY_SQUEEZE_SPREAD_ATR_MIN, see its own docstring
+in config.py for the real paper-mode case study that added it) is
+UNCHANGED and still gates entries in both scan_for_new_buy_signal() and
+scan_for_new_buy_signal_live(), in the same place (checked right after
+a fresh crossover fires, before the scan-window check, using the same
+spread_atr_ratio already computed for the unconditional diagnostic
+line). This gate operates on EMA5/EMA25/VWAP bunching, which has nothing
+to do with the ROC-based trigger condition itself -- it's an orthogonal
+filter on the trigger candle, so it carries over unchanged regardless
+of what generates the crossover.
 
-EMA5/EMA25 are no longer read by this module's own signal logic (VWAP
-still is, as the trigger-candle filter). They remain available on the
-shared indicator dataframe (indicators.compute_indicators()) for the
-SELL side and for the squeeze diagnostics below, which are left
-unconditional/unchanged -- costs nothing to keep logging them even
-though they no longer gate a buy entry.
+EMA5/EMA25 are no longer read by the CONDITION functions below (VWAP
+still is, as the trigger-candle filter) -- but they remain available on
+the shared indicator dataframe (indicators.compute_indicators()) for
+the SELL side and for the squeeze gate/diagnostics above, unaffected.
 """
 
 import sys
@@ -52,7 +52,7 @@ from config import (
     BUY_PENDING_SIGNAL_MAX_CANDLES, BUY_TARGET_RISK_REWARD,
     BUY_ROC_PERIOD, BUY_ROC_CROSS_LEVEL,
     BUY_LOW_PREMIUM_SL_THRESHOLD, BUY_LOW_PREMIUM_SL_MIN_PCT,
-    BUY_SCAN_WINDOWS,
+    BUY_SCAN_WINDOWS, BUY_SQUEEZE_SPREAD_ATR_MIN,
 )
 from calendar_utils import now_ist
 from pending import round_to_half
@@ -68,12 +68,9 @@ def _condition_holds_buy(row):
     is_fresh_crossover_signal_buy() below adds the transition
     requirement on top of this for scanning brand-new entries.
 
-    Guards against a NaN ROC (e.g. very first candles of the whole
-    fetched history, before BUY_ROC_PERIOD prior closes exist) by
-    treating NaN as "condition not met" rather than raising or silently
-    comparing NaN (which pandas would otherwise evaluate as False anyway
-    for `>`, but being explicit here makes the guard visible in code
-    rather than relying on that NaN-comparison quirk).
+    NaN ROC (e.g. very first candles of the whole fetched history,
+    before BUY_ROC_PERIOD prior closes exist) is treated as "condition
+    not met" rather than raising.
     """
     roc = row["roc"]
     if roc is None or pd.isna(roc):
@@ -87,8 +84,8 @@ def check_entry_signal_buy(df):
     true on the latest candle? Used to decide whether a resting pending
     buy signal's setup has been INVALIDATED, not to scan for brand-new
     entries (see is_fresh_crossover_signal_buy() for that) -- same role
-    this function has always played, just backed by the new ROC
-    condition now instead of the old EMA-based one.
+    this function has always played, just backed by the ROC condition
+    now instead of the old EMA-based one.
     """
     if df is None or len(df) < 1:
         return False
@@ -108,12 +105,10 @@ def is_fresh_crossover_signal_buy(df):
     the same "not already holding" guard against a re-fire on an
     unchanged state -- if ROC was already above the level last candle
     too, this is a persisting state, not a fresh cross, and won't fire
-    again here (same reasoning as the sell side's own crossover check
-    and the old EMA-based version of this function).
+    again here.
 
-    NaN ROC on either candle (e.g. right at the edge of the fetched
-    history, before BUY_ROC_PERIOD prior closes exist) is treated as
-    "not enough data to judge a cross" -- fails closed, does not fire.
+    NaN ROC on either candle is treated as "not enough data to judge a
+    cross" -- fails closed, does not fire.
     """
     if df is None or len(df) < 2:
         return False
@@ -133,44 +128,40 @@ def compute_pending_buy_signal(trigger_candle, buy_leg_info, qty, prev_candle):
     """
     Locks a resting BUY limit order off the just-closed trigger candle N.
 
-    CHANGED (2026-09-04, ROC rework): entry/SL/target formulas replaced
-    wholesale, per Pragnesh's explicit spec:
+    CHANGED (2026-09-04, ROC rework): entry/SL formulas replaced, per
+    Pragnesh's explicit spec:
 
       entry_limit = trigger candle N's own CLOSE (was EMA5[N]). Still a
       pullback entry -- the limit rests at this level and fills on a
       LATER candle whose LOW comes down to touch it (see
       check_fill_buy()), not at N's own close as a market order.
 
-      sl_price = candle N-1's LOW. prev_candle is now a REQUIRED
-      argument, not optional -- is_fresh_crossover_signal_buy() already
-      requires df.iloc[-2] to exist for the ROC-cross check itself, so a
-      valid prev_candle is guaranteed to be available by the time this
-      is called from either scan path.
+      sl_price = candle N-1's LOW (was min(N's low, N's vwap), further
+      floored against N-1's low). prev_candle is now a REQUIRED argument
+      -- is_fresh_crossover_signal_buy() already requires df.iloc[-2] to
+      exist for the ROC-cross check itself, so a valid prev_candle is
+      guaranteed to be available by the time this is called from either
+      scan path.
 
       target_price = entry_limit + BUY_TARGET_RISK_REWARD * risk, RR now
-      1:1 by default (config.BUY_TARGET_RISK_REWARD, was 1:3 then 1:2 at
-      various earlier points -- see that constant's own docstring).
+      1:1 by default (config.BUY_TARGET_RISK_REWARD, was 1:2 before this
+      rework).
 
-    REINSTATED (2026-09-04, low-premium SL floor): Pragnesh's call --
-    bring back the same widen-only floor the sell side and the old
-    EMA-based buy engine both had (config.BUY_LOW_PREMIUM_SL_THRESHOLD /
-    BUY_LOW_PREMIUM_SL_MIN_PCT, Rs.99 / 10%, unchanged values), now
-    applied on top of the NEW prev-candle-low SL instead of the old
-    min(low, vwap) SL. If entry_limit is under Rs.99, sl_price is
-    additionally floored at entry_limit * (1 - 10%) -- this can only
-    WIDEN the stop (push it further from entry), never tighten it or
-    override the prev-candle-low value when that's already wider. Same
-    "checked against the ROUNDED entry_limit" reasoning as the sell
-    side's own version of this floor (a raw value near the threshold
-    could legitimately round across it).
+    UNCHANGED (2026-07-31, low-premium SL floor): mirrors the sell
+    side's LOW_PREMIUM_SL_THRESHOLD/MIN_PCT treatment, inverted for
+    direction -- buy's SL sits BELOW entry, so the floor widens it
+    DOWNWARD (min, not max) when entry_limit is under
+    BUY_LOW_PREMIUM_SL_THRESHOLD (Rs.99). Widen-only: this can only push
+    SL further from entry, never closer than what candle N-1's low
+    already computed. Checked against the ROUNDED entry_limit, same
+    reasoning as before.
 
     Rounding: entry_limit rounded first, then the low-premium floor
-    check runs against that rounded value, then sl_price (prev-candle
-    low vs. the floor, whichever is lower/wider) is rounded, then
-    risk/target_price are computed off the already-rounded values --
-    same order as the sell side and the original buy engine, so the
-    real risk:reward sent to the webhook matches BUY_TARGET_RISK_REWARD
-    exactly rather than drifting off raw floats.
+    check runs against that rounded value, then sl_price is rounded,
+    then risk/target_price computed off the already-rounded values --
+    same order as before, so the real risk:reward sent to the webhook
+    matches BUY_TARGET_RISK_REWARD exactly rather than drifting off raw
+    floats.
 
     Returns None if the computed risk (entry_limit - sl_price) is <= 0
     -- i.e. candle N-1's low (or the low-premium floor) is at or above
@@ -211,9 +202,10 @@ def compute_pending_buy_signal(trigger_candle, buy_leg_info, qty, prev_candle):
 def check_fill_buy(pending, last_candle):
     """
     Fill check for a resting pending buy signal: has a later candle's LOW
-    come down far enough to touch the resting BUY limit? UNCHANGED by the
-    2026-09-04 ROC rework -- still `last["low"] <= pending["entry_limit"]`,
-    regardless of what entry_limit is now anchored to.
+    come down far enough to touch the resting BUY limit? Mirrors the
+    sell engine's fill check (`last["high"] >= pending["entry_limit"]`),
+    inverted for a buy limit resting BELOW where price was at trigger
+    time: `last["low"] <= pending["entry_limit"]`.
     """
     return last_candle["low"] <= pending["entry_limit"]
 
@@ -221,21 +213,41 @@ def check_fill_buy(pending, last_candle):
 def scan_for_new_buy_signal(candles_by_symbol, compute_indicators_fn, log=True):
     """
     Standalone scan across a dict of {leg_info: candles} for a fresh
-    ROC-based buy crossover. Mirrors the live scan's shape but stays
-    decoupled from state.json / smart_api, so it can run against
-    historical candle_history/ CSVs (see test_buy_signal_engine.py)
-    without a broker session.
+    buy-side crossover. This mirrors signal_engine.scan_for_new_signal()'s
+    shape but is deliberately decoupled from state.json / smart_api / the
+    live run loop -- it takes already-fetched candles and an indicator
+    function, so it can be called equally from:
+      (a) a future integration into main.py (passing real candles +
+          indicators.compute_indicators), or
+      (b) a standalone backtest/validation script (see
+          test_buy_signal_engine.py) against historical candle_history/
+          CSVs, without needing a broker session at all.
 
     candles_by_symbol: dict of {leg_info_dict: list_of_candle_dicts},
     where leg_info_dict has at least "symbol", "token", "strike",
     "option_type", and "lot_size" (qty).
 
     Returns the first pending buy signal found (dict, see
-    compute_pending_buy_signal()), or None if nothing fired this scan
-    -- either because no leg had a fresh crossover, or because a
-    crossover fired but compute_pending_buy_signal() returned None
-    (risk <= 0, logged and skipped). Only ever returns at most one
-    signal per call, same single-slot reasoning as the sell engine.
+    compute_pending_buy_signal()), or None if nothing fired this scan.
+    Only ever returns at most one signal per call, same single-slot
+    reasoning as the sell engine (see its docstring on why it stops after
+    the first leg that fires).
+
+    NEW (2026-08-14, buy-side squeeze gate): mirrors the sell-side
+    squeeze gate in signal_engine.scan_for_new_signal() -- a fresh
+    crossover that would otherwise return a pending signal is now
+    blocked if spread_atr_ratio on the trigger candle is below
+    config.BUY_SQUEEZE_SPREAD_ATR_MIN. This REVERSES the earlier "buy
+    stays squeeze-free by design" call -- see BUY_SQUEEZE_SPREAD_ATR_MIN's
+    docstring in config.py for the real paper-mode case study that
+    overturned it (2026-08-14, NIFTY18AUG2624200PE, two same-day
+    whipsaw entries at spread_atr_ratio 0.50 and 0.35). Added here (the
+    standalone/backtest scan) as well as in scan_for_new_buy_signal_live()
+    below, so test_buy_signal_engine.py's replay against candle_history/
+    CSVs reflects the same gating live trading now has -- a backtest
+    that silently omitted this gate would no longer represent what the
+    live system actually does. None (ATR not yet available) fails open,
+    same reasoning as the sell-side gate.
     """
     for leg_info, candles in candles_by_symbol.items():
         df = compute_indicators_fn(candles)
@@ -243,24 +255,48 @@ def scan_for_new_buy_signal(candles_by_symbol, compute_indicators_fn, log=True):
             continue
 
         if is_fresh_crossover_signal_buy(df):
+            _, spread_pct, spread_atr_ratio = compute_squeeze_metrics(df.iloc[-1])
+            ratio_str = f"{spread_atr_ratio:.2f}" if spread_atr_ratio is not None else "n/a"
+
+            if spread_atr_ratio is not None and spread_atr_ratio < BUY_SQUEEZE_SPREAD_ATR_MIN:
+                if log:
+                    print(
+                        f"BUY signal on {leg_info.get('symbol', '?')} blocked -- squeeze "
+                        f"detected (spread_pct={spread_pct:.3f}%, spread/atr={ratio_str} < "
+                        f"{BUY_SQUEEZE_SPREAD_ATR_MIN}). Continuing to next leg this scan.",
+                        file=sys.stderr,
+                    )
+                continue
+
             trigger_candle = df.iloc[-1].to_dict()
             prev_candle = df.iloc[-2].to_dict()
             qty = leg_info.get("lot_size", leg_info.get("qty"))
             pending = compute_pending_buy_signal(trigger_candle, leg_info, qty, prev_candle)
 
+            # NEW (2026-09-04, ROC rework): compute_pending_buy_signal()
+            # can now return None if risk <= 0 (prev candle's low, or the
+            # low-premium floor, at or above the trigger candle's close)
+            # -- log and continue to the next leg rather than treating
+            # None as a valid pending signal.
             if pending is None:
                 if log:
                     print(
                         f"[buy scan] ROC crossover fired on {leg_info.get('symbol', '?')} "
-                        f"but computed risk <= 0 (prev candle low >= trigger close) -- "
+                        "but computed risk <= 0 (prev candle low >= trigger close) -- "
                         "skipping this signal.",
                         file=sys.stderr,
                     )
                 continue
 
             if log:
-                _, spread_pct, spread_atr_ratio = compute_squeeze_metrics(df.iloc[-1])
-                ratio_str = f"{spread_atr_ratio:.2f}" if spread_atr_ratio is not None else "n/a"
+                # NEW (2026-07-30, squeeze diagnostics): log spread_pct /
+                # spread-to-ATR on the actual trigger candle for every
+                # fired signal too, not just no-fire scans -- this is the
+                # data we need later to check "did signals that got
+                # stopped out disproportionately have a tight spread_pct
+                # or spread_atr_ratio here". Diagnostic logging stays
+                # unconditional; BUY_SQUEEZE_SPREAD_ATR_MIN above is what
+                # now actually gates the entry.
                 print(
                     f"PENDING BUY SIGNAL: BUY {pending['buy_symbol']} resting limit @ "
                     f"{pending['entry_limit']:.2f} (SL={pending['sl_price']:.2f}, "
@@ -292,9 +328,14 @@ def manage_pending_buy_signal(pending, df, max_candles=BUY_PENDING_SIGNAL_MAX_CA
     """
     Standalone lifecycle check for a resting pending buy signal against a
     fresh candle dataframe: fill / cancel / expire / still-resting.
-    UNCHANGED in shape by the 2026-09-04 ROC rework -- fill checked
-    first, then cancellation (now backed by the ROC-based
-    check_entry_signal_buy()), then expiry.
+    Mirrors pending.manage_pending_signal()'s three-step order (fill
+    checked first, then cancellation, then expiry), but returns a result
+    dict instead of mutating state.json directly -- this keeps the
+    module usable standalone (backtest) as well as from a future live
+    integration, which would be responsible for translating the result
+    into its own state keys (e.g. state["pending_buy_signal"] /
+    state["open_buy_position"], kept separate from the sell side's
+    "pending_signal" / "open_position" so the two setups never collide).
 
     Returns one of:
       {"status": "filled", "candle": <row dict>}
@@ -328,7 +369,8 @@ def manage_pending_buy_signal(pending, df, max_candles=BUY_PENDING_SIGNAL_MAX_CA
 # ============================================================================
 # LIVE-WIRED functions below -- these actually call the broker/webhook and
 # read/write state.json, unlike everything above (which is pure logic, no
-# side effects).
+# side effects). NOT yet called from main.py -- see main.py wiring
+# discussion for the open run-order question before these get hooked in.
 # ============================================================================
 
 import angelone_client as ac
@@ -346,36 +388,90 @@ def scan_for_new_buy_signal_live(state, leg_pairs, instruments, expiry, smart_ap
     token lookups beyond what the sell side already resolves each day.
 
     REMOVED (2026-09-04): the same-strike guard
-    (_strike_has_open_sell_position()) that used to skip a strike here if
-    the sell side had an open position on it. Pragnesh's explicit call:
-    the buy side should fire independent of the sell side's state --
-    low-cost long option, the same-strike overlap this guard protected
-    against is no longer judged worth the missed signals. Every leg in
-    leg_pairs is now scanned unconditionally on every call to this
-    function (still subject to run-order gating in main.py and the
-    single-slot pending_buy_signal limit, both UNCHANGED).
+    (_strike_has_open_sell_position(), now deleted) that used to skip a
+    strike here if the sell side had an open position on it. Pragnesh's
+    explicit call: the buy side should fire independent of the sell
+    side's state -- a long option's downside is capped at the premium
+    paid, low enough cost that the same-strike overlap risk this guard
+    protected against is no longer worth the missed signals it was
+    blocking. Every leg in leg_pairs is now scanned unconditionally on
+    every call to this function (still subject to run-order gating in
+    main.py and the single-slot pending_buy_signal limit, both
+    UNCHANGED, and still subject to the squeeze gate and scan-window
+    gate below, both also UNCHANGED).
 
     Mirrors signal_engine.scan_for_new_signal()'s single-slot,
     stop-after-first-fire shape.
 
-    FIX (2026-07-29, run-level dedup): accepts run_cache, passed through
-    to get_candles_with_cache() -- see market_data.py's docstring.
+    FIX (2026-07-29, run-level dedup): get_candles_with_cache() only ever
+    de-duplicated the PREVIOUS day's candles, and only across separate
+    runs -- nothing stopped this loop from re-fetching TODAY's candles
+    for a token the sell engine had already fetched moments earlier in
+    the same run. Confirmed via a 2026-07-28 live run log showing two
+    separate getCandleData calls, seconds apart, for the same sell-strike
+    token. Now accepts run_cache and passes it through -- when
+    scan_for_new_signal() (or priming) already fetched this token this
+    run, this call becomes a free in-memory hit instead of a second real
+    API call. See market_data.get_candles_with_cache()'s docstring for
+    the full root-cause writeup.
+
+    FIX (2026-07-29, hedge-leg + CE-only scope correction): previously
+    this looped BOTH sell_strike and hedge_strike as independent buy
+    crossover candidates -- taking real buy trades on the hedge strike
+    too, which was never intended (BUY_ENGINE_INTEGRATION.md section 3
+    only ever describes the SELL strike as what the buy engine watches)
+    -- and was hardcoded to CE only. Pragnesh's call: limit buy scanning
+    to exactly the two SELL strikes (ATM+100 CE and ATM-100 PE),
+    dropping both hedge strikes from buy-signal scanning entirely, and
+    extending the mirror-image bullish-crossover check to the PE sell
+    strike too (no longer CE-only). The crossover/entry/SL/target math
+    itself (is_fresh_crossover_signal_buy, compute_pending_buy_signal)
+    was always option-type-agnostic -- it operates on whatever candle
+    series it's given -- so this is purely a scope change in which
+    strike/option_type this loop resolves and fetches, not a change to
+    any underlying signal logic.
+
+    NEW (2026-08-12, buy-side scan time window): a fresh crossover that
+    would otherwise create a new pending_buy_signal is now blocked
+    outside config.BUY_SCAN_WINDOWS (09:30-11:45, 13:30-14:45) -- see
+    calendar_utils.is_within_buy_scan_window(). Squeeze-diagnostic
+    logging above this check remains unconditional; this gate is
+    time-of-day only, buy side stays squeeze-free by design. A
+    time-blocked leg does NOT return -- loop continues to the next leg
+    this run, same reasoning as the sell-side squeeze gate.
+
+    NEW (2026-08-14, buy-side squeeze gate -- REVERSES the earlier "buy
+    stays squeeze-free by design" call above and in
+    BUY_ENGINE_INTEGRATION.md section 1). Real paper-mode evidence
+    overturned that assumption: two same-day NIFTY18AUG2624200PE buy
+    trades (11:16 entry, spread_atr_ratio=0.50; 11:36 re-entry,
+    spread_atr_ratio=0.35) both fired as genuine fresh crossovers --
+    setup correctly formed, no bug in the detection logic -- while
+    EMA5/EMA25/VWAP were still tightly bunched at the trigger candle,
+    and both were stopped out within minutes for near-identical losses
+    (-244.03, -243.95). The original reasoning (EMA5's lag already
+    filters squeeze-driven noise before a buy signal can fire) doesn't
+    hold: the lag changes WHICH candle a signal fires on, not whether
+    the three lines are still bunched together at that later candle.
+    Pragnesh's call, 2026-08-14: mirror the sell-side gate exactly (same
+    BUY_SQUEEZE_SPREAD_ATR_MIN=0.5 cutoff value as the sell side's own
+    SELL_SQUEEZE_SPREAD_ATR_MIN, same hard-gate-not-shadow-mode posture,
+    same continue-not-return -- a squeeze-blocked leg didn't genuinely
+    fire, so it must not consume the single-slot stop-after-first-fire
+    behavior). Checked here using the spread_atr_ratio already computed
+    above for the unconditional squeeze-diagnostic log line -- no second
+    computation needed. Checked BEFORE the buy-side scan-window gate
+    below (arbitrary order between two independent O(1) gates; squeeze
+    first only to mirror the sell side's own ordering, which checks
+    squeeze before doing any further per-leg work).
 
     CHANGED (2026-09-04, ROC rework): the entry condition itself
     (is_fresh_crossover_signal_buy) and entry/SL/target computation
     (compute_pending_buy_signal) are now ROC-based -- see this module's
-    top docstring and each function's own docstring for the full
-    writeup. The scope of WHICH strikes get scanned (both sell strikes,
-    ATM+100 CE and ATM-100 PE, no hedge legs) is UNCHANGED from the
-    2026-07-29 scope-correction fix.
-
-    NEW (2026-08-12, buy-side scan time window): a fresh crossover that
-    would otherwise create a new pending_buy_signal is still blocked
-    outside config.BUY_SCAN_WINDOWS (09:30-11:45, 13:30-14:45) -- see
-    calendar_utils.is_within_buy_scan_window(). Squeeze-diagnostic
-    logging above this check remains unconditional. A time-blocked leg
-    does NOT return -- loop continues to the next leg this run, same
-    reasoning as the sell-side squeeze gate.
+    top docstring. The squeeze gate and scan-window gate below are
+    UNCHANGED, both mechanically and in placement -- they operate on
+    EMA5/EMA25/VWAP bunching and time-of-day respectively, neither of
+    which has anything to do with what generates the crossover.
     """
     for leg in leg_pairs:
         strike = leg["sell_strike"]
@@ -390,9 +486,10 @@ def scan_for_new_buy_signal_live(state, leg_pairs, instruments, expiry, smart_ap
         if df is None:
             continue
 
-        # NEW (2026-07-30, squeeze diagnostics): kept unconditional --
-        # see this module's top docstring for why this still runs even
-        # though the buy entry no longer gates on it.
+        # NEW (2026-07-30, squeeze diagnostics): log spread_pct /
+        # spread-to-ATR for this strike's latest candle on every live
+        # run, fire or no-fire -- this loop runs against real paper-mode
+        # data. UNCHANGED by the ROC rework.
         _, spread_pct, spread_atr_ratio = compute_squeeze_metrics(df.iloc[-1])
         ratio_str = f"{spread_atr_ratio:.2f}" if spread_atr_ratio is not None else "n/a"
         last = df.iloc[-1]
@@ -405,15 +502,34 @@ def scan_for_new_buy_signal_live(state, leg_pairs, instruments, expiry, smart_ap
         )
 
         if is_fresh_crossover_signal_buy(df):
+            # NEW (2026-08-14, buy-side squeeze gate): see docstring
+            # above for the full case-study writeup. spread_atr_ratio is
+            # already computed above for the unconditional diagnostic
+            # line -- reused here, not recomputed. None (ATR not yet
+            # available, e.g. very start of fetched history) fails open,
+            # same as the sell-side gate's treatment.
+            if spread_atr_ratio is not None and spread_atr_ratio < BUY_SQUEEZE_SPREAD_ATR_MIN:
+                print(
+                    f"[buy scan] fresh crossover on {option_type} {strike} blocked -- "
+                    f"squeeze detected (spread_pct={spread_pct:.3f}%, "
+                    f"spread/atr={spread_atr_ratio:.3f} < {BUY_SQUEEZE_SPREAD_ATR_MIN}). "
+                    "Continuing to next leg this run.",
+                    file=sys.stderr,
+                )
+                continue
+
             # NEW (2026-08-12, buy-side scan time window): checked here,
-            # AFTER the squeeze diagnostic already printed above, but
-            # BEFORE a new pending_buy_signal gets created. Does not
-            # affect an already-resting pending_buy_signal or
-            # already-open open_buy_position (managed elsewhere,
-            # unconditionally, every run).
+            # AFTER the squeeze diagnostic already printed above (so
+            # diagnostics stay unconditional), but BEFORE a new
+            # pending_buy_signal gets created. Pragnesh's call: buy side
+            # stays squeeze-free by design -- this is a time-of-day gate,
+            # not a squeeze gate. Does not affect an already-resting
+            # pending_buy_signal or already-open open_buy_position (those
+            # are managed elsewhere, unconditionally, every run -- see
+            # calendar_utils.is_within_buy_scan_window()'s docstring).
             if not is_within_buy_scan_window():
                 print(
-                    f"[buy scan] fresh ROC crossover on {option_type} {strike} outside "
+                    f"[buy scan] fresh crossover on {option_type} {strike} outside "
                     f"allowed scan windows ({BUY_SCAN_WINDOWS}) -- not entering. "
                     "Continuing to next leg this run.",
                     file=sys.stderr,
@@ -426,6 +542,11 @@ def scan_for_new_buy_signal_live(state, leg_pairs, instruments, expiry, smart_ap
             leg_info = {**token_info, "strike": strike, "option_type": option_type}
 
             pending_signal = compute_pending_buy_signal(trigger_candle, leg_info, qty, prev_candle)
+
+            # NEW (2026-09-04, ROC rework): compute_pending_buy_signal()
+            # can now return None if risk <= 0 -- log and continue to the
+            # next leg rather than storing None as a "valid" pending
+            # signal in state.json.
             if pending_signal is None:
                 print(
                     f"[buy scan] ROC crossover fired on {option_type} {strike} but computed "
@@ -449,13 +570,15 @@ def scan_for_new_buy_signal_live(state, leg_pairs, instruments, expiry, smart_ap
 def manage_pending_buy_signal_live(state, instruments, expiry, smart_api,
                                     prev_day, prev_day_cache, today_start, run_cache=None):
     """
-    Live-wired lifecycle for the resting pending buy signal. UNCHANGED in
-    shape by the 2026-09-04 ROC rework: EOD discard check first, then
-    fill, then cancellation (now via the ROC-based check_entry_signal_buy()),
-    then expiry.
+    Live-wired lifecycle for the resting pending buy signal. Mirrors
+    pending.manage_pending_signal()'s live wiring exactly: EOD discard
+    check first, then fill (before cancellation/expiry -- a real resting
+    limit doesn't care whether the setup is still technically valid the
+    moment price reaches it), then cancellation, then expiry.
 
-    FIX (2026-07-29, run-level dedup): accepts run_cache, passed through
-    to get_candles_with_cache().
+    FIX (2026-07-29, run-level dedup): now accepts run_cache and passes
+    it through to get_candles_with_cache() -- see that function's
+    docstring in market_data.py for the full root-cause writeup.
     """
     pending = state["pending_buy_signal"]
 
@@ -535,19 +658,26 @@ def manage_pending_buy_signal_live(state, instruments, expiry, smart_api,
 def manage_open_buy_position_live(state, instruments, expiry, smart_api,
                                    prev_day, prev_day_cache, today_start, run_cache=None):
     """
-    Live-wired exit management for a filled buy position. UNCHANGED by
-    the 2026-09-04 ROC rework -- SL/target were already fixed numbers
-    locked at fill time (just computed differently now, see
-    compute_pending_buy_signal()); this function only ever reads
-    pos["sl_price"]/pos["target_price"], never recomputes them.
+    Live-wired exit management for a filled buy position. Checks
+    high/low touch (not close-only -- mirrors position.manage_spread_exit()'s
+    intrabar reasoning: a real resting SL/target order fires the moment
+    price TOUCHES it, not only if the candle closes past it), and forces
+    a flatten at EOD square-off since the buy side stays intraday too
+    (Pragnesh's call: not positional).
 
-    Checks high/low touch (not close-only), and forces a flatten at EOD
-    square-off since the buy side stays intraday. SL is BELOW entry,
-    target is ABOVE -- SL touch = low <= sl_price, target touch = high
-    >= target_price. On a same-candle double-touch, SL wins.
+    SL is BELOW entry for a long option, target is ABOVE -- opposite
+    orientation from the sell side's bracket, so SL touch = low <=
+    sl_price, target touch = high >= target_price. On a same-candle
+    double-touch (rare, wide-range candle), SL wins -- same
+    protect-capital-first tie-break as the sell side's bracket.
 
-    FIX (2026-07-29, run-level dedup): accepts run_cache, passed through
-    to get_candles_with_cache().
+    FIX (2026-07-29, run-level dedup): now accepts run_cache and passes
+    it through to get_candles_with_cache() -- see that function's
+    docstring in market_data.py for the full root-cause writeup. This
+    function is called unconditionally at the top of every run when a
+    buy position is open (before the sell side runs), so it's often the
+    FIRST thing to populate run_cache for a given token this run, same
+    role priming plays on the lock run.
     """
     pos = state["open_buy_position"]
 
