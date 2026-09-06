@@ -9,6 +9,7 @@ import datetime as dt
 import pandas as pd
 
 from calendar_utils import now_ist
+from config import BUY_ROC_PERIOD
 
 
 CANDLE_WINDOW_SECONDS = 300  # 5-minute candles
@@ -78,57 +79,6 @@ def _drop_unclosed_last_candle(df):
     return df
 
 
-def _detect_candle_gaps(df):
-    """
-    NEW (2026-08-13, candle-skip detection -- diagnostic only, does not
-    change behavior or gate any signal).
-
-    Independent safety net alongside the 2026-08-13 fetch_5min_candles()
-    stale-todate-across-retries fix. That fix addresses the specific
-    mechanism confirmed on 2026-08-13 (a rate-limit backoff freezing
-    `todate` before the entry candle closed). This check instead looks
-    at the SYMPTOM directly -- a hole in today's expected 5-min candle
-    sequence -- so it still catches a missing candle from any other
-    cause (a different retry/timing edge case, a genuine Angel One gap,
-    etc.), not just the one root cause already fixed.
-
-    Expects df already restricted to today's CLOSED candles (i.e. call
-    this AFTER the today_mask filter and AFTER
-    _drop_unclosed_last_candle() -- a still-forming last candle is not a
-    gap, it just hasn't closed yet, and would otherwise be a false
-    positive here).
-
-    Walks consecutive today-candle timestamps looking for any step
-    larger than one CANDLE_WINDOW_SECONDS. Logs each detected gap with
-    the missing timestamp(s) implied. Deliberately does NOT drop rows,
-    backfill, or block the signal -- see buy_signal_engine.py's squeeze
-    diagnostics for the same "log first, gate later once real paper-mode
-    frequency is known" pattern. Wrapped defensively, same as
-    _drop_unclosed_last_candle(): a check that can never crash a run
-    managing a live position over a formatting issue.
-    """
-    if df.empty or len(df) < 2:
-        return
-
-    try:
-        times = df["time"].tolist()
-        for prev_t, curr_t in zip(times, times[1:]):
-            gap_seconds = (curr_t - prev_t).total_seconds()
-            if gap_seconds > CANDLE_WINDOW_SECONDS:
-                missing_count = int(gap_seconds // CANDLE_WINDOW_SECONDS) - 1
-                missing_first = prev_t + dt.timedelta(seconds=CANDLE_WINDOW_SECONDS)
-                print(
-                    f"[WARN] _detect_candle_gaps: gap in today's candle sequence -- "
-                    f"prev={prev_t} next={curr_t} gap={gap_seconds:.0f}s "
-                    f"(~{missing_count} candle(s) missing, starting {missing_first}). "
-                    "Not backfilled or blocked -- diagnostic only.",
-                    file=sys.stderr,
-                )
-    except Exception as e:
-        print(f"[DEBUG] _detect_candle_gaps: check failed ({e!r}) -- "
-              "continuing without it.", file=sys.stderr)
-
-
 def compute_indicators(candles):
     df = pd.DataFrame(candles)
     if df.empty:
@@ -167,6 +117,28 @@ def compute_indicators(candles):
     ).max(axis=1)
     df["atr"] = tr.ewm(alpha=1 / ATR_PERIOD, adjust=False).mean()
 
+    # NEW (2026-09-04, buy-engine ROC replacement): ROC(BUY_ROC_PERIOD),
+    # standard percent rate-of-change on close --
+    # (close - close[N periods ago]) / close[N periods ago] * 100 --
+    # mirroring TradingView's own ROC indicator (same formula, same
+    # default length=18 in the settings Pragnesh shared). Computed BEFORE
+    # the today-filter, same full-history warmup pattern as EMA5/EMA25/ATR
+    # above, so the first candles of the session already have a real
+    # (non-NaN) ROC value seeded from the prior day's tail instead of
+    # needing 18 fresh candles after market open before the buy engine
+    # can fire at all. This REPLACES the EMA5/EMA25/VWAP crossover as the
+    # buy engine's entry trigger -- see buy_signal_engine.py's
+    # is_fresh_crossover_signal_buy() for the actual condition (ROC
+    # crosses above BUY_ROC_CROSS_LEVEL, price above VWAP). EMA5/EMA25
+    # are left in place above, still used by the SELL side and by the
+    # squeeze diagnostics -- this is purely additive, no existing column
+    # touched or removed.
+    df["roc"] = (
+        (df["close"] - df["close"].shift(BUY_ROC_PERIOD))
+        / df["close"].shift(BUY_ROC_PERIOD)
+        * 100
+    )
+
     today_mask = df["time"].dt.date == today
     typical_price = (df["high"] + df["low"] + df["close"]) / 3
     cum_vol = df["volume"].where(today_mask, 0).cumsum()
@@ -182,13 +154,6 @@ def compute_indicators(candles):
     # len(df) < 2 check below (an unclosed candle shouldn't count toward
     # "do we have enough data").
     df = _drop_unclosed_last_candle(df)
-
-    # NEW (2026-08-13, candle-skip detection): diagnostic-only gap check
-    # across today's remaining CLOSED candles -- see _detect_candle_gaps()
-    # docstring above for why this runs here specifically (after the
-    # unclosed-candle drop, so a still-forming last candle is never
-    # mistaken for a gap) and why it doesn't block or alter df.
-    _detect_candle_gaps(df)
 
     if len(df) < 2:
         print(
@@ -258,6 +223,14 @@ def compute_squeeze_metrics(row):
     so a squeeze mechanically produces a tight SL, and (b) a squeeze is
     also when EMA5/VWAP tend to whipsaw back and forth, producing
     repeated low-conviction "fresh crossovers" rather than one clean one.
+
+    NOTE (2026-09-04): this diagnostic is still computed and logged from
+    buy_signal_engine.py's scan loops even though the buy engine's actual
+    entry trigger no longer uses EMA5/EMA25 (replaced by ROC -- see
+    indicators.py's ROC block and buy_signal_engine.py's
+    is_fresh_crossover_signal_buy()). Left unconditional/as-is: it costs
+    nothing extra to keep logging it, and it remains meaningful for the
+    SELL side, which still gates on it via SELL_SQUEEZE_SPREAD_ATR_MIN.
 
     Returns (spread, spread_pct, spread_atr_ratio):
       - spread           = max(ema5, ema25, vwap) - min(ema5, ema25, vwap)
