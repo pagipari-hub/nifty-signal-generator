@@ -184,6 +184,28 @@ BUY_ROC_CROSS_LEVEL = 1.0
 # low, see buy_signal_engine.compute_pending_buy_signal()). Was 2.
 BUY_TARGET_RISK_REWARD = 1           # target = entry + RR * (entry - SL)
 
+# NEW (2026-09-07, second buy trigger -- wide-spread EMA crossover):
+# Pragnesh's call -- an ADDITIONAL, independent buy trigger alongside
+# the ROC trigger above (both active; whichever fires first for a given
+# leg in a given run wins, since there's only one pending_buy_signal
+# slot). Fires when EMA5 has a FRESH crossover above BOTH EMA25 and
+# VWAP (mirrors the pre-ROC buy condition, but without requiring EMA25
+# below VWAP first) AND spread_atr_ratio (indicators.compute_squeeze_metrics(),
+# the same metric the squeeze gates use in the opposite direction) is
+# ABOVE this threshold -- i.e. EMA5/EMA25/VWAP are WIDE apart, not
+# bunched. This is deliberately the inverse condition from
+# BUY_SQUEEZE_SPREAD_ATR_MIN (which blocks the ROC trigger when spread
+# is too TIGHT, <0.5) -- here a wide spread is required before the EMA
+# crossover trigger is allowed to fire at all, on the theory that a
+# clean EMA5 breakout away from EMA25/VWAP (not a whipsaw-prone tight
+# bunch) is what makes this specific crossover trustworthy. See
+# buy_signal_engine.py's is_fresh_crossover_signal_buy_ema() for the
+# full condition and compute_pending_buy_signal_ema_squeeze() for how
+# entry is priced (40% OHLC pullback, NOT the ROC trigger's close-based
+# entry). SL/target formulas are otherwise identical to the ROC
+# trigger's (prior candle's low + low-premium floor, 1:1 RR).
+BUY_EMA_CROSSOVER_SPREAD_ATR_MIN = 2.0
+
 # NEW (2026-08-13, PDL fallback entry -- SELL side only, both PE and CE
 # legs). Design agreed with Pragnesh: when neither leg's EMA/VWAP
 # crossover fires, a sell entry can instead trigger off that leg's own
