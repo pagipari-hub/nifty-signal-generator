@@ -53,9 +53,10 @@ from config import (
     BUY_ROC_PERIOD, BUY_ROC_CROSS_LEVEL,
     BUY_LOW_PREMIUM_SL_THRESHOLD, BUY_LOW_PREMIUM_SL_MIN_PCT,
     BUY_SCAN_WINDOWS, BUY_SQUEEZE_SPREAD_ATR_MIN,
+    BUY_EMA_CROSSOVER_SPREAD_ATR_MIN,
 )
 from calendar_utils import now_ist
-from pending import round_to_half
+from pending import round_to_half, compute_entry_price
 from indicators import compute_squeeze_metrics
 
 
@@ -124,54 +125,85 @@ def is_fresh_crossover_signal_buy(df):
     return bool(crossed_above and above_vwap)
 
 
-def compute_pending_buy_signal(trigger_candle, buy_leg_info, qty, prev_candle):
+def _condition_holds_buy_ema(row):
     """
-    Locks a resting BUY limit order off the just-closed trigger candle N.
-
-    CHANGED (2026-09-04, ROC rework): entry/SL formulas replaced, per
-    Pragnesh's explicit spec:
-
-      entry_limit = trigger candle N's own CLOSE (was EMA5[N]). Still a
-      pullback entry -- the limit rests at this level and fills on a
-      LATER candle whose LOW comes down to touch it (see
-      check_fill_buy()), not at N's own close as a market order.
-
-      sl_price = candle N-1's LOW (was min(N's low, N's vwap), further
-      floored against N-1's low). prev_candle is now a REQUIRED argument
-      -- is_fresh_crossover_signal_buy() already requires df.iloc[-2] to
-      exist for the ROC-cross check itself, so a valid prev_candle is
-      guaranteed to be available by the time this is called from either
-      scan path.
-
-      target_price = entry_limit + BUY_TARGET_RISK_REWARD * risk, RR now
-      1:1 by default (config.BUY_TARGET_RISK_REWARD, was 1:2 before this
-      rework).
-
-    UNCHANGED (2026-07-31, low-premium SL floor): mirrors the sell
-    side's LOW_PREMIUM_SL_THRESHOLD/MIN_PCT treatment, inverted for
-    direction -- buy's SL sits BELOW entry, so the floor widens it
-    DOWNWARD (min, not max) when entry_limit is under
-    BUY_LOW_PREMIUM_SL_THRESHOLD (Rs.99). Widen-only: this can only push
-    SL further from entry, never closer than what candle N-1's low
-    already computed. Checked against the ROUNDED entry_limit, same
-    reasoning as before.
-
-    Rounding: entry_limit rounded first, then the low-premium floor
-    check runs against that rounded value, then sl_price is rounded,
-    then risk/target_price computed off the already-rounded values --
-    same order as before, so the real risk:reward sent to the webhook
-    matches BUY_TARGET_RISK_REWARD exactly rather than drifting off raw
-    floats.
-
-    Returns None if the computed risk (entry_limit - sl_price) is <= 0
-    -- i.e. candle N-1's low (or the low-premium floor) is at or above
-    N's own close, which shouldn't normally happen on a genuine upward
-    ROC cross but is checked defensively rather than sending a
-    nonsensical/inverted SL to the webhook. Callers must check for a
-    None return and skip the signal (log + continue to the next leg)
-    rather than treating it as a valid pending signal.
+    NEW (2026-09-07, second buy trigger). State check for the wide-spread
+    EMA crossover trigger: is EMA5 currently above BOTH EMA25 and VWAP?
+    Mirrors the pre-ROC buy condition's "reclaimed VWAP" idea, but
+    WITHOUT the old requirement that EMA25 also sit below VWAP first --
+    Pragnesh's spec here is just "ema5 turns greater than both vwap and
+    ema25", not a specific pre-cross ordering of the other two lines
+    relative to each other.
     """
-    entry_limit = round_to_half(trigger_candle["close"])
+    return bool(row["ema5"] > row["vwap"] and row["ema5"] > row["ema25"])
+
+
+def is_fresh_crossover_signal_buy_ema(df):
+    """
+    NEW (2026-09-07, second buy trigger -- independent of, and checked
+    alongside, the ROC trigger above). Fires when BOTH of these hold on
+    the latest candle:
+
+      1. TRANSITION: EMA5 was NOT above both EMA25 and VWAP on the
+         PREVIOUS candle, but IS above both on the CURRENT candle --
+         i.e. EMA5 just crossed whichever of EMA25/VWAP it hadn't
+         already cleared ("crosses either ema25 or vwap and turns
+         greater than both", per Pragnesh's spec). A persisting state
+         (already above both last candle too) does not re-fire, same
+         "fresh, not held" reasoning as every other crossover check in
+         this codebase.
+      2. WIDE SPREAD: spread_atr_ratio (indicators.compute_squeeze_metrics()
+         on the current candle) is ABOVE BUY_EMA_CROSSOVER_SPREAD_ATR_MIN
+         (2.0) -- the inverse of the squeeze gates elsewhere, which
+         block on a ratio that's too LOW. Here a wide-enough spread is
+         REQUIRED before this trigger is allowed to fire at all.
+         spread_atr_ratio is None when ATR isn't available yet (e.g.
+         very start of the fetched history) -- treated as "can't confirm
+         wide enough", fails closed, does not fire (unlike the sell-side
+         squeeze gate's fail-OPEN on None, since this trigger requires
+         proof of a wide spread rather than merely the absence of proof
+         of a tight one).
+    """
+    if df is None or len(df) < 2:
+        return False
+
+    current = df.iloc[-1]
+    previous = df.iloc[-2]
+
+    crossed_above = _condition_holds_buy_ema(current) and not _condition_holds_buy_ema(previous)
+    if not crossed_above:
+        return False
+
+    _, _, spread_atr_ratio = compute_squeeze_metrics(current)
+    if spread_atr_ratio is None:
+        return False
+
+    return bool(spread_atr_ratio > BUY_EMA_CROSSOVER_SPREAD_ATR_MIN)
+
+
+def _build_pending_buy_signal(entry_price_raw, prev_candle, buy_leg_info, qty):
+    """
+    NEW (2026-09-07): shared core extracted out of compute_pending_buy_signal()
+    so the new wide-spread EMA crossover trigger (compute_pending_buy_signal_ema_squeeze()
+    below) can reuse the identical SL/floor/target math without duplicating
+    it -- the two triggers differ ONLY in how the raw entry price is
+    derived (trigger candle's close for ROC, 40% OHLC pullback for the
+    EMA trigger), per Pragnesh's explicit spec that SL/target stay the
+    same across both. Nothing about compute_pending_buy_signal()'s own
+    external signature or behavior changes -- it's now a thin wrapper
+    around this.
+
+    SL = candle N-1's LOW, floored (widen-only) at
+    entry_limit * (1 - BUY_LOW_PREMIUM_SL_MIN_PCT) when the rounded
+    entry_limit is under BUY_LOW_PREMIUM_SL_THRESHOLD (Rs.99). Target =
+    entry_limit + BUY_TARGET_RISK_REWARD * risk (1:1 by default).
+    Rounding order: entry_limit first, then the low-premium floor check
+    runs against that rounded value, then sl_price is rounded, then
+    risk/target_price are computed off the already-rounded values.
+
+    Returns None if risk (entry_limit - sl_price) <= 0.
+    """
+    entry_limit = round_to_half(entry_price_raw)
 
     sl_price = prev_candle["low"]
     if entry_limit < BUY_LOW_PREMIUM_SL_THRESHOLD:
@@ -197,6 +229,55 @@ def compute_pending_buy_signal(trigger_candle, buy_leg_info, qty, prev_candle):
         "trigger_time": now_ist().isoformat(),
         "candles_waited": 0,
     }
+
+
+def compute_pending_buy_signal(trigger_candle, buy_leg_info, qty, prev_candle):
+    """
+    Locks a resting BUY limit order off the just-closed trigger candle N,
+    for the ROC trigger (see is_fresh_crossover_signal_buy()).
+
+    entry_limit = trigger candle N's own CLOSE. Still a pullback entry --
+    the limit rests at this level and fills on a LATER candle whose LOW
+    comes down to touch it (see check_fill_buy()), not at N's own close
+    as a market order.
+
+    SL/target math lives in _build_pending_buy_signal() (shared with the
+    2026-09-07 wide-spread EMA trigger, compute_pending_buy_signal_ema_squeeze()
+    below) -- see that function's docstring for the formulas. Behavior/
+    signature here are UNCHANGED from the 2026-09-04 ROC rework.
+
+    Returns None if the computed risk (entry_limit - sl_price) is <= 0.
+    Callers must check for a None return and skip the signal (log +
+    continue to the next leg) rather than treating it as a valid
+    pending signal.
+    """
+    return _build_pending_buy_signal(trigger_candle["close"], prev_candle, buy_leg_info, qty)
+
+
+def compute_pending_buy_signal_ema_squeeze(trigger_candle, buy_leg_info, qty, prev_candle):
+    """
+    NEW (2026-09-07): locks a resting BUY limit order for the wide-spread
+    EMA crossover trigger (see is_fresh_crossover_signal_buy_ema()) --
+    independent of, and using a DIFFERENT entry price than, the ROC
+    trigger's compute_pending_buy_signal() above.
+
+    entry_limit = pending.compute_entry_price(trigger_candle) -- the same
+    40% OHLC pullback formula the SELL side already uses
+    (low + 0.40 * (high - low)), per Pragnesh's explicit spec ("entry on
+    40% ohlc candle"). Still a pullback entry -- fills on a later
+    candle's LOW touching this level, same fill mechanics as the ROC
+    trigger (check_fill_buy() is shared, doesn't care which trigger
+    produced entry_limit).
+
+    SL/target: IDENTICAL formulas to the ROC trigger -- SL = candle
+    N-1's low (+ low-premium floor), target = 1:1 RR. See
+    _build_pending_buy_signal()'s docstring, shared by both triggers.
+
+    Returns None if the computed risk (entry_limit - sl_price) is <= 0,
+    same contract as compute_pending_buy_signal().
+    """
+    entry_price_raw = compute_entry_price(trigger_candle)
+    return _build_pending_buy_signal(entry_price_raw, prev_candle, buy_leg_info, qty)
 
 
 def check_fill_buy(pending, last_candle):
@@ -302,6 +383,46 @@ def scan_for_new_buy_signal(candles_by_symbol, compute_indicators_fn, log=True):
                     f"{pending['entry_limit']:.2f} (SL={pending['sl_price']:.2f}, "
                     f"target={pending['target_price']:.2f}) "
                     f"[roc={trigger_candle['roc']:.2f}] "
+                    f"[squeeze diag: spread_pct={spread_pct:.3f}% spread/atr={ratio_str}]"
+                )
+            return pending
+        elif is_fresh_crossover_signal_buy_ema(df):
+            # NEW (2026-09-07, wide-spread EMA crossover trigger):
+            # independent second trigger, only reached when the ROC
+            # trigger above did NOT fire this leg this scan. Entry price
+            # is the 40% OHLC pullback (compute_entry_price()), NOT the
+            # ROC trigger's close-based entry -- see
+            # compute_pending_buy_signal_ema_squeeze()'s docstring.
+            # spread_atr_ratio > BUY_EMA_CROSSOVER_SPREAD_ATR_MIN is
+            # already required by is_fresh_crossover_signal_buy_ema()
+            # itself, so no separate squeeze-gate check is needed here
+            # (unlike the ROC branch above, which must actively check
+            # AGAINST a tight spread -- this trigger's own condition
+            # already requires a wide one).
+            trigger_candle = df.iloc[-1].to_dict()
+            prev_candle = df.iloc[-2].to_dict()
+            qty = leg_info.get("lot_size", leg_info.get("qty"))
+            pending = compute_pending_buy_signal_ema_squeeze(trigger_candle, leg_info, qty, prev_candle)
+
+            if pending is None:
+                if log:
+                    print(
+                        f"[buy scan] EMA/wide-spread crossover fired on {leg_info.get('symbol', '?')} "
+                        "but computed risk <= 0 (prev candle low >= 40% pullback entry) -- "
+                        "skipping this signal.",
+                        file=sys.stderr,
+                    )
+                continue
+
+            if log:
+                _, spread_pct, spread_atr_ratio = compute_squeeze_metrics(df.iloc[-1])
+                ratio_str = f"{spread_atr_ratio:.2f}" if spread_atr_ratio is not None else "n/a"
+                print(
+                    f"PENDING BUY SIGNAL (EMA/wide-spread): BUY {pending['buy_symbol']} "
+                    f"resting limit @ {pending['entry_limit']:.2f} (SL={pending['sl_price']:.2f}, "
+                    f"target={pending['target_price']:.2f}) "
+                    f"[ema5={trigger_candle['ema5']:.2f} ema25={trigger_candle['ema25']:.2f} "
+                    f"vwap={trigger_candle['vwap']:.2f}] "
                     f"[squeeze diag: spread_pct={spread_pct:.3f}% spread/atr={ratio_str}]"
                 )
             return pending
@@ -561,6 +682,51 @@ def scan_for_new_buy_signal_live(state, leg_pairs, instruments, expiry, smart_ap
             print(f"PENDING BUY SIGNAL: BUY {p['buy_symbol']} resting limit @ {p['entry_limit']:.2f} "
                   f"(SL={p['sl_price']:.2f}, target={p['target_price']:.2f}) "
                   f"[roc={trigger_candle['roc']:.2f}] "
+                  f"[squeeze diag: spread_pct={spread_pct:.3f}% spread/atr={ratio_str}]")
+            return
+
+        elif is_fresh_crossover_signal_buy_ema(df):
+            # NEW (2026-09-07, wide-spread EMA crossover trigger):
+            # independent second trigger, only reached when the ROC
+            # trigger above did NOT fire this leg this run. No separate
+            # squeeze-gate check needed here -- is_fresh_crossover_signal_buy_ema()
+            # itself already REQUIRES spread_atr_ratio >
+            # BUY_EMA_CROSSOVER_SPREAD_ATR_MIN (2.0), the inverse
+            # requirement from the ROC branch's squeeze gate above. Still
+            # subject to the same scan-window gate as the ROC trigger --
+            # both are NEW buy-signal creation, so the same time-of-day
+            # risk reasoning applies.
+            if not is_within_buy_scan_window():
+                print(
+                    f"[buy scan] fresh EMA/wide-spread crossover on {option_type} {strike} outside "
+                    f"allowed scan windows ({BUY_SCAN_WINDOWS}) -- not entering. "
+                    "Continuing to next leg this run.",
+                    file=sys.stderr,
+                )
+                continue
+
+            trigger_candle = df.iloc[-1].to_dict()
+            prev_candle = df.iloc[-2].to_dict()
+            qty = token_info["lot_size"]
+            leg_info = {**token_info, "strike": strike, "option_type": option_type}
+
+            pending_signal = compute_pending_buy_signal_ema_squeeze(trigger_candle, leg_info, qty, prev_candle)
+
+            if pending_signal is None:
+                print(
+                    f"[buy scan] EMA/wide-spread crossover fired on {option_type} {strike} but "
+                    "computed risk <= 0 (prev candle low >= 40% pullback entry) -- skipping this "
+                    "signal, continuing to next leg this run.",
+                    file=sys.stderr,
+                )
+                continue
+
+            state["pending_buy_signal"] = pending_signal
+            p = state["pending_buy_signal"]
+            print(f"PENDING BUY SIGNAL (EMA/wide-spread): BUY {p['buy_symbol']} resting limit @ "
+                  f"{p['entry_limit']:.2f} (SL={p['sl_price']:.2f}, target={p['target_price']:.2f}) "
+                  f"[ema5={trigger_candle['ema5']:.2f} ema25={trigger_candle['ema25']:.2f} "
+                  f"vwap={trigger_candle['vwap']:.2f}] "
                   f"[squeeze diag: spread_pct={spread_pct:.3f}% spread/atr={ratio_str}]")
             return
 
