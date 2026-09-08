@@ -1,6 +1,6 @@
 {
   "open_position": null,
-  "last_run": "2026-09-08T10:05:43.910343+05:30",
+  "last_run": "2026-09-08T10:10:59.480309+05:30",
   "heartbeat_date": "2026-09-08",
   "daily_strikes_date": "2026-09-08",
   "daily_atm": 23650,
@@ -17,28 +17,16 @@
     }
   ],
   "pending_signal": null,
-  "pending_buy_signal": {
-    "buy_symbol": "NIFTY15SEP2623550PE",
-    "buy_token": "47300",
-    "strike": 23550,
-    "option_type": "PE",
-    "qty": 65,
-    "entry_limit": 63.5,
-    "sl_price": 57.0,
-    "target_price": 70.0,
-    "risk": 6.5,
-    "trigger_time": "2026-09-08T09:57:11.985722+05:30",
-    "candles_waited": 1
-  },
+  "pending_buy_signal": null,
   "open_buy_position": {
     "symbol": "NIFTY15SEP2623550PE",
     "token": "47300",
     "strike": 23550,
     "option_type": "PE",
     "qty": 65,
-    "entry_price": 65.5,
-    "sl_price": 59.0,
-    "target_price": 72.0
+    "entry_price": 63.5,
+    "sl_price": 57.0,
+    "target_price": 70.0
   },
   "daily_pdl": {
     "PE": null,
