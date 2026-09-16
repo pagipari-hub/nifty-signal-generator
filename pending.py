@@ -102,8 +102,27 @@ def compute_pending_signal(trigger_candle, sell_leg_info, hedge_leg_info, qty):
     high/VWAP comparison (cheap premiums are more prone to a tight
     absolute SL getting whipsawed).
 
+    NOTE (2026-09-15, sell-side trailing Supertrend SL): this
+    max(high, vwap) SL is UNCHANGED and still what's used/displayed while
+    the signal is PENDING (unfilled). It only serves as the pending-phase
+    SL now -- once the signal actually fills (whether it came from this
+    EMA/VWAP path or the PDL fallback path, see
+    compute_pending_signal_pdl()), manage_pending_signal()'s fill branch
+    overwrites open_position's sl_price with the LIVE Supertrend(10,2)
+    upper-band value computed on the fill candle, and every subsequent
+    run trails it further via position.manage_spread_exit(). Pragnesh's
+    explicit call: Supertrend trailing starts only at fill, not while
+    still pending, and applies uniformly regardless of which entry path
+    produced the signal.
+
     Target is fixed 1:2 risk:reward off entry_limit, using the resulting
     SL distance as risk.
+
+    NOTE (2026-09-15): target_price is still computed and stored here
+    (kept for schema/backward-compat -- see config.TARGET_RISK_REWARD's
+    docstring), but is NO LONGER used to decide exits once a position is
+    open -- see position.manage_spread_exit(). An open sell position now
+    exits only via trailing-SL touch or EOD square-off.
 
     FIX (2026-07-17, rounding re-added): entry_limit/sl_price/target_price
     are rounded to the nearest 0.5 -- entry_limit FIRST (since the
@@ -173,8 +192,19 @@ def compute_pending_signal_pdl(trigger_candle, sell_leg_info, hedge_leg_info, qt
     a separate constant (Pragnesh's call: "RR 1:2 (minimum 10%)" maps
     directly onto the existing low-premium floor).
 
+    NOTE (2026-09-15, sell-side trailing Supertrend SL): same as
+    compute_pending_signal() above -- this trigger-candle-high SL is
+    UNCHANGED and still what's used/displayed while the signal is
+    PENDING. It's superseded by the live Supertrend(10,2) upper band the
+    moment the signal fills -- see manage_pending_signal()'s fill branch
+    below, which applies the same Supertrend-seeding regardless of
+    signal_source.
+
     Target = fixed TARGET_RISK_REWARD (1:2) off entry_limit, same
-    formula and same constant as compute_pending_signal().
+    formula and same constant as compute_pending_signal(). As with the
+    EMA/VWAP path, target_price is still computed/stored here but no
+    longer decides exits once the position is open (see
+    position.manage_spread_exit()).
 
     Fill check reuses the EXACT SAME mechanic as the EMA/VWAP signal
     (last["high"] >= entry_limit in manage_pending_signal()) -- no
@@ -276,6 +306,20 @@ def manage_pending_signal(state, instruments, expiry, smart_api, prev_day, prev_
     this close to close has no time left to be managed properly if it
     fills, so it's discarded outright rather than filled, regardless of
     whether price happened to touch entry_limit this same candle.
+
+    NEW (2026-09-15, sell-side trailing Supertrend SL): on fill, the new
+    open_position's sl_price is seeded from the LIVE Supertrend(10,2)
+    upper-band value on the fill candle (df.iloc[-1]["st_upper"]) --
+    NOT from pending["sl_price"] (the pending-phase SL, whichever
+    formula produced it). Pragnesh's explicit call: Supertrend trailing
+    starts at fill, using the fill candle's own live band value as the
+    starting point, regardless of whether the signal came from the
+    EMA/VWAP path or the PDL fallback path -- exit management is
+    orthogonal to how the signal was triggered. See
+    indicators._compute_supertrend() for where st_upper comes from and
+    position.manage_spread_exit() for how it trails further from here.
+    pending["sl_price"] is no longer written into open_position at all --
+    superseded entirely by st_upper at the moment of fill.
     """
     pending = state["pending_signal"]
 
@@ -323,6 +367,16 @@ def manage_pending_signal(state, instruments, expiry, smart_api, prev_day, prev_
         })
 
         if webhook_confirmed_ok(resp):
+            # NEW (2026-09-15): seed the OPEN position's trailing SL from
+            # the live Supertrend upper-band value on the fill candle --
+            # not from pending["sl_price"] -- regardless of whether this
+            # signal came from the EMA/VWAP path or the PDL fallback path
+            # (signal_source). See this function's docstring above for
+            # the full writeup. st_upper is guaranteed present on `last`
+            # (compute_indicators() always adds it via
+            # indicators._compute_supertrend()).
+            initial_trailing_sl = round_to_half(float(last["st_upper"]))
+
             state["open_position"] = {
                 "spread": True,
                 "option_type": pending["option_type"],
@@ -339,7 +393,7 @@ def manage_pending_signal(state, instruments, expiry, smart_api, prev_day, prev_
                 "qty": pending["qty"],
                 "entry_price": pending["entry_limit"],
                 "hedge_entry_price": pending.get("hedge_entry_price"),
-                "sl_price": pending["sl_price"],
+                "sl_price": initial_trailing_sl,
                 "target_price": pending["target_price"],
                 "entry_time": now_ist().isoformat(),
                 # NEW (2026-08-13, PDL fallback entry): carried through onto
@@ -352,7 +406,9 @@ def manage_pending_signal(state, instruments, expiry, smart_api, prev_day, prev_
             state["pending_signal"] = None
             source_tag = " [PDL breakdown]" if pending.get("signal_source") == "pdl" else ""
             print(f"FILLED: SELL {pending['sell_symbol']} @ {pending['entry_limit']}{source_tag} "
-                  f"+ hedge BUY {hedge_token_info['symbol']}, qty={pending['qty']}")
+                  f"+ hedge BUY {hedge_token_info['symbol']}, qty={pending['qty']} "
+                  f"-- trailing SL seeded from live Supertrend(10,2) upper band = "
+                  f"{initial_trailing_sl:.2f} (pending-phase SL was {pending['sl_price']:.2f})")
         else:
             print(
                 "ENTRY_SPREAD webhook not confirmed -- leaving pending_signal in "
