@@ -238,3 +238,45 @@ BUY_EMA_CROSSOVER_SPREAD_ATR_MIN = 2.0
 # "log first, calibrate later" pattern as SELL_SQUEEZE_SPREAD_ATR_MIN
 # above.
 PDL_MIN_PREV_DAY_VOLUME = 50000
+
+# NEW (2026-09-15, sell-side trailing Supertrend SL): Pragnesh's call --
+# replace the sell side's fixed SL (max(trigger high, trigger VWAP), or
+# the trigger candle's own high for a PDL-sourced signal) with a
+# trailing Supertrend(10,2) SL once a position is OPEN. Scope is
+# sell-side only for now (buy side unaffected); applies uniformly
+# regardless of which entry path produced the position -- EMA/VWAP or
+# PDL fallback (see pending.compute_pending_signal_pdl()) -- since exit
+# management is orthogonal to how the signal was triggered. Deliberately
+# a SEPARATE ATR period from the existing ATR_PERIOD (14) in
+# indicators.py, which feeds squeeze diagnostics only -- reusing that
+# period here would silently change squeeze-diagnostic values too,
+# which is not the intent.
+#
+# Trailing behavior: recomputed every run while a position is open,
+# monotonic-tighten only (for a short, "tighter" means the SL value
+# DECREASES toward price, since SL sits above price) -- new_sl =
+# min(current_sl, live_supertrend_upper_band), never loosens. No floor
+# at entry price -- the trailing SL is allowed to drop below entry
+# (locks in guaranteed profit on stop-out); intentional, not a bug. See
+# position.manage_spread_exit() for where this is applied.
+#
+# Seeding: at fill time, the position's initial sl_price is seeded from
+# the LIVE Supertrend upper-band value computed on the fill candle (not
+# from the pending signal's already-locked SL, whichever formula
+# produced it) -- Pragnesh's explicit call. While a signal is still
+# PENDING (unfilled), SL display/logic is UNCHANGED (still whatever
+# compute_pending_signal() / compute_pending_signal_pdl() computed) --
+# Supertrend trailing only starts once the position is actually open.
+#
+# Target: target_price is still computed and stored (see
+# TARGET_RISK_REWARD note above) but is no longer used to decide exits --
+# an open sell position now exits ONLY via trailing-SL touch or EOD
+# square-off. KNOWN CROSS-REPO GAP: the webhook server (separate repo,
+# not visible/editable from here) still receives target_price in the
+# MANAGE_SPREAD payload and may still be checking it server-side for the
+# bracket decision -- until that side is updated to ignore target_price
+# for sell-side exits, a position could still close early on a target
+# touch there even though this repo's own local pre-check no longer
+# treats target as an exit condition. Flagged, not yet resolved.
+SUPERTREND_ATR_PERIOD = 10
+SUPERTREND_MULTIPLIER = 2
