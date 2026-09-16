@@ -9,7 +9,7 @@ import datetime as dt
 import pandas as pd
 
 from calendar_utils import now_ist
-from config import BUY_ROC_PERIOD
+from config import BUY_ROC_PERIOD, SUPERTREND_ATR_PERIOD, SUPERTREND_MULTIPLIER
 
 
 CANDLE_WINDOW_SECONDS = 300  # 5-minute candles
@@ -79,6 +79,116 @@ def _drop_unclosed_last_candle(df):
     return df
 
 
+def _compute_supertrend(df, period, multiplier):
+    """
+    NEW (2026-09-15, sell-side trailing SL groundwork): standard
+    Supertrend(period, multiplier) computation. Adds four columns:
+      - atr_<period>   -- Wilder-smoothed ATR at THIS period (deliberately
+                           separate from the module-level ATR_PERIOD=14
+                           used by compute_squeeze_metrics(); reusing that
+                           one would silently change squeeze-diagnostic
+                           values too, see config.SUPERTREND_ATR_PERIOD's
+                           docstring)
+      - st_upper        -- the "final upper band" series. For a SHORT
+                            position this is the relevant trailing-SL
+                            candidate (resistance above price) -- see
+                            position.manage_spread_exit() for how it's
+                            applied (monotonic-tighten only, i.e.
+                            new_sl = min(old_sl, st_upper[-1])).
+      - st_lower        -- the "final lower band" series (not currently
+                            consumed anywhere -- sell side only uses
+                            st_upper -- but computed for symmetry/future
+                            use, e.g. if this is ever extended to the buy
+                            side).
+      - supertrend / supertrend_direction -- the standard flip-based
+                            Supertrend line + direction (+1 up, -1 down).
+                            Not currently used for any entry/exit decision
+                            (Pragnesh's call: trailing SL only, no
+                            flip-based exit) -- computed for visibility/
+                            future use only.
+
+    Must run on the FULL multi-day history passed in (same warm-up
+    pattern as EMA5/EMA25/ATR(14)/ROC elsewhere in this module) -- the
+    final-band recurrence needs several candles of lookback to be
+    meaningful, and restricting to today-only candles first would give a
+    cold-start band on the very first candles of each session.
+
+    Implemented as an explicit Python loop rather than a vectorized
+    pandas operation -- the final_upper/final_lower recurrence depends on
+    each row's own previous value, which doesn't vectorize cleanly. Candle
+    volumes here (a few hundred rows per day of multi-day history) make
+    this a non-issue performance-wise.
+    """
+    if df.empty:
+        df["st_upper"] = []
+        df["st_lower"] = []
+        df["supertrend"] = []
+        df["supertrend_direction"] = []
+        return df
+
+    atr_col = f"atr_{period}"
+    prev_close = df["close"].shift(1)
+    tr = pd.concat(
+        [
+            df["high"] - df["low"],
+            (df["high"] - prev_close).abs(),
+            (df["low"] - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    df[atr_col] = tr.ewm(alpha=1 / period, adjust=False).mean()
+
+    hl2 = (df["high"] + df["low"]) / 2
+    basic_upper = (hl2 + multiplier * df[atr_col]).tolist()
+    basic_lower = (hl2 - multiplier * df[atr_col]).tolist()
+    closes = df["close"].tolist()
+
+    n = len(df)
+    final_upper = [0.0] * n
+    final_lower = [0.0] * n
+    supertrend = [0.0] * n
+    supertrend_direction = [0] * n
+
+    for i in range(n):
+        if i == 0:
+            final_upper[i] = basic_upper[i]
+            final_lower[i] = basic_lower[i]
+            supertrend[i] = final_upper[i]
+            supertrend_direction[i] = -1
+            continue
+
+        if basic_upper[i] < final_upper[i - 1] or closes[i - 1] > final_upper[i - 1]:
+            final_upper[i] = basic_upper[i]
+        else:
+            final_upper[i] = final_upper[i - 1]
+
+        if basic_lower[i] > final_lower[i - 1] or closes[i - 1] < final_lower[i - 1]:
+            final_lower[i] = basic_lower[i]
+        else:
+            final_lower[i] = final_lower[i - 1]
+
+        if supertrend[i - 1] == final_upper[i - 1]:
+            if closes[i] <= final_upper[i]:
+                supertrend[i] = final_upper[i]
+                supertrend_direction[i] = -1
+            else:
+                supertrend[i] = final_lower[i]
+                supertrend_direction[i] = 1
+        else:
+            if closes[i] >= final_lower[i]:
+                supertrend[i] = final_lower[i]
+                supertrend_direction[i] = 1
+            else:
+                supertrend[i] = final_upper[i]
+                supertrend_direction[i] = -1
+
+    df["st_upper"] = final_upper
+    df["st_lower"] = final_lower
+    df["supertrend"] = supertrend
+    df["supertrend_direction"] = supertrend_direction
+    return df
+
+
 def compute_indicators(candles):
     df = pd.DataFrame(candles)
     if df.empty:
@@ -138,6 +248,14 @@ def compute_indicators(candles):
         / df["close"].shift(BUY_ROC_PERIOD)
         * 100
     )
+
+    # NEW (2026-09-15, sell-side trailing Supertrend SL): computed on the
+    # FULL multi-day history, same warm-up reasoning as ATR(14)/EMA/ROC
+    # above -- see _compute_supertrend()'s docstring for the full
+    # writeup. Uses its OWN atr_10 column, deliberately separate from
+    # df["atr"] (14) above, which squeeze diagnostics depend on and must
+    # not change.
+    df = _compute_supertrend(df, SUPERTREND_ATR_PERIOD, SUPERTREND_MULTIPLIER)
 
     today_mask = df["time"].dt.date == today
     typical_price = (df["high"] + df["low"] + df["close"]) / 3
@@ -231,6 +349,13 @@ def compute_squeeze_metrics(row):
     is_fresh_crossover_signal_buy()). Left unconditional/as-is: it costs
     nothing extra to keep logging it, and it remains meaningful for the
     SELL side, which still gates on it via SELL_SQUEEZE_SPREAD_ATR_MIN.
+
+    NOTE (2026-09-15): deliberately still reads row["atr"] -- the
+    ATR(14) column -- NOT the new row["atr_10"] added for Supertrend.
+    These are two independent ATR series at different periods; squeeze
+    diagnostics must keep using the same ATR(14) they've always used, so
+    historical spread_atr_ratio values stay comparable across this
+    change.
 
     Returns (spread, spread_pct, spread_atr_ratio):
       - spread           = max(ema5, ema25, vwap) - min(ema5, ema25, vwap)
