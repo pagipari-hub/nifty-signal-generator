@@ -10,6 +10,7 @@ import angelone_client as ac
 from calendar_utils import now_ist, is_eod_squareoff_time
 from market_data import get_candles_with_cache
 from indicators import compute_indicators
+from pending import round_to_half
 from webhook import send_to_webhook, webhook_confirmed_ok
 
 
@@ -26,6 +27,10 @@ def manage_legacy_single_leg_exit(state, pos, instruments, expiry, smart_api, pr
     through to get_candles_with_cache() -- see that function's docstring
     in market_data.py. Behaviour otherwise fully unchanged, per this
     function's own "do not change" note above.
+
+    NOTE (2026-09-15): the sell-side trailing Supertrend SL change is
+    scoped to manage_spread_exit() only -- this legacy path is untouched,
+    same "do not change" rule as always.
     """
     token_info = ac.resolve_option_token(instruments, expiry, pos["strike"], pos["option_type"])
     if not token_info:
@@ -74,28 +79,64 @@ def manage_spread_exit(state, pos, instruments, expiry, smart_api, prev_day, pre
     position open with unbounded intrabar risk (Pragnesh's "what if it
     flies to 99?" scenario).
 
-    This function no longer decides SL vs target at all. It just fetches
-    the candle (unchanged) and hands high/low/close, plus the position's
-    fixed SL/target levels, to webhook.py via the new MANAGE_SPREAD
+    This function no longer decides SL vs target at all (target is now
+    gone entirely for the sell side -- see NEW note below). It fetches
+    the candle, updates the trailing SL, and hands high/low/close plus
+    the position's (now trailing) SL to webhook.py via the MANAGE_SPREAD
     action. webhook.py owns the actual bracket decision -- see
-    check_spread_bracket() there: checks against HIGH/LOW (not close),
-    with an explicit SL-wins tie-break if a single candle's range touches
-    both levels (Pragnesh's call: a same-candle double-touch reads as a
-    pullback, protect capital first).
+    check_spread_bracket() there: checks against HIGH/LOW (not close).
 
     EOD square-off is kept as a SEPARATE, simpler path on purpose -- it
-    isn't an SL/target bracket decision, just "flatten regardless of
-    price", so it still goes straight through EXIT_SPREAD rather than
-    MANAGE_SPREAD.
+    isn't an SL bracket decision, just "flatten regardless of price", so
+    it still goes straight through EXIT_SPREAD rather than MANAGE_SPREAD.
 
     NOTE: this only fixes WHICH price triggers the exit and WHO decides
-    it. It does not yet place a real broker-side SL/target order in
-    LIVE_MODE -- see CHANGELOG for that as a separate, larger piece of
-    work (confirmed real-order entry -> real bracket placement).
+    it. It does not yet place a real broker-side SL order in LIVE_MODE --
+    see CHANGELOG for that as a separate, larger piece of work (confirmed
+    real-order entry -> real bracket placement).
 
     FIX (2026-07-29, run-level dedup): now accepts run_cache and passes it
     through to get_candles_with_cache() -- see that function's docstring
     in market_data.py for the full root-cause writeup.
+
+    NEW (2026-09-15, sell-side trailing Supertrend SL): Pragnesh's call --
+    the fixed SL (max(high, vwap) for an EMA/VWAP-sourced signal, or the
+    trigger candle's own high for a PDL-sourced one -- see pending.py) is
+    fully replaced, for an OPEN sell position, by a trailing
+    Supertrend(10,2) SL. This applies uniformly regardless of
+    pos.get("signal_source") -- exit management doesn't distinguish how
+    the position was entered. Every run this function is called:
+      1. Reads the current candle's live Supertrend upper band
+         (df.iloc[-1]["st_upper"] -- see indicators._compute_supertrend()).
+      2. Tightens pos["sl_price"] via new_sl = min(pos["sl_price"],
+         st_upper) -- MONOTONIC, only ever decreases. For a short, SL
+         sits above price, so "tighter" means the SL value gets SMALLER
+         (moves down toward price) -- this is deliberately min(), not
+         max(). A live Supertrend value that's WIDER than the current SL
+         (e.g. after a brief reversal widens the band) is ignored; the
+         SL never loosens once a position is open. This can and will
+         push sl_price below the original entry_price over the life of a
+         winning trade -- intentional, not a bug (locks in a
+         guaranteed-profit stop once it happens).
+      3. Persists the tightened value back into pos["sl_price"] /
+         state["open_position"]["sl_price"] before the webhook call, so
+         it's what gets logged/sent AND what's compared against next run.
+
+    target_price is no longer used to decide anything here -- an open
+    sell position now exits only via trailing-SL touch or EOD
+    square-off. target_price is still read from pos and still sent in
+    the MANAGE_SPREAD payload (schema/backward-compat -- see
+    config.TARGET_RISK_REWARD's docstring), but this function's own
+    local pre-check no longer treats a target touch as a reason to fetch
+    the hedge LTP or expect a close.
+
+    KNOWN CROSS-REPO GAP (flagged, not resolved by this change): the
+    webhook server (separate repo, not visible/editable from here) also
+    receives target_price in this payload and may still be evaluating it
+    server-side for the actual bracket decision. Until that side is
+    updated to ignore target_price for sell-side exits, a position could
+    still be closed early there on a target touch even though this
+    function no longer treats target as an exit condition on this side.
     """
     sell_leg = pos["sell_leg"]
     token_info = ac.resolve_option_token(instruments, expiry, sell_leg["strike"], pos["option_type"])
@@ -109,12 +150,26 @@ def manage_spread_exit(state, pos, instruments, expiry, smart_api, prev_day, pre
 
     last = df.iloc[-1]
 
+    # ---- NEW (2026-09-15): trail the SL via live Supertrend, monotonic
+    # tighten only (min, not max -- see docstring above for why). Done
+    # BEFORE any of the debug printing / EOD / bracket logic below, so
+    # every subsequent read of pos["sl_price"] this run already reflects
+    # the tightened value. ----
+    live_supertrend_upper = round_to_half(float(last["st_upper"]))
+    previous_sl = pos["sl_price"]
+    new_sl = min(previous_sl, live_supertrend_upper)
+    if new_sl != previous_sl:
+        print(f"Trailing SL tightened for {sell_leg['symbol']}: "
+              f"{previous_sl:.2f} -> {new_sl:.2f} (live Supertrend upper band={live_supertrend_upper:.2f})")
+    pos["sl_price"] = new_sl
+    sl_price = new_sl
+
     # DEBUG (temporary): this function no longer decides SL/target itself
-    # (see FIX note above -- that now lives in webhook.py), but it's
-    # still useful to see locally what candle data is being sent up and
-    # what the webhook decided, without needing to cross-reference two
-    # services' logs. Read-only, wrapped so a formatting issue here can
-    # never block a real exit.
+    # (see FIX note above -- bracket decision now lives in webhook.py),
+    # but it's still useful to see locally what candle data is being sent
+    # up and what the trailing SL currently is, without needing to
+    # cross-reference two services' logs. Read-only, wrapped so a
+    # formatting issue here can never block a real exit.
     try:
         candle_time_str = last["time"].strftime("%H:%M")
     except Exception:
@@ -126,9 +181,9 @@ def manage_spread_exit(state, pos, instruments, expiry, smart_api, prev_day, pre
         print(f"Checking exit: {sell_leg['symbol']}", file=sys.stderr)
         print(f"Last candle: {candle_time_str}", file=sys.stderr)
         print(f"Close = {close:.2f}  Low = {low:.2f}  High = {high:.2f}", file=sys.stderr)
-        print(f"SL = {pos['sl_price']:.2f}  Target = {pos['target_price']:.2f}", file=sys.stderr)
-        print(f"Target touched intra-candle (low <= target) : {low <= pos['target_price']}", file=sys.stderr)
-        print(f"SL touched intra-candle (high >= SL) : {high >= pos['sl_price']}", file=sys.stderr)
+        print(f"Trailing SL = {sl_price:.2f}  (target_price={pos['target_price']:.2f}, "
+              f"no longer used for exit decisions)", file=sys.stderr)
+        print(f"SL touched intra-candle (high >= SL) : {high >= sl_price}", file=sys.stderr)
     except Exception as e:
         print(f"Checking exit: {sell_leg['symbol']}: debug logging failed ({e!r}) -- continuing without it.",
               file=sys.stderr)
@@ -170,36 +225,34 @@ def manage_spread_exit(state, pos, instruments, expiry, smart_api, prev_day, pre
             )
         return
 
-    # ---- SL/target bracket check -- decision now lives in webhook.py ----
+    # ---- SL bracket check -- decision still lives in webhook.py ----
     # FIX (2026-07-06): the hedge-price fetch below used to run
     # UNCONDITIONALLY on every run a position is open -- including every
     # "still open, nothing happened" run, which is most of them. That
     # added an extra API call (plus PRE_CALL_DELAY_SECONDS) BEFORE the
     # webhook call on every single run, including the one run that
-    # actually matters most: the run where SL/target just got hit,
-    # where the webhook needs to be reached as fast as possible, not
-    # slower. It also added unnecessary rate-limit exposure on every
-    # idle run for zero benefit on those runs.
+    # actually matters most: the run where SL just got hit, where the
+    # webhook needs to be reached as fast as possible, not slower. It
+    # also added unnecessary rate-limit exposure on every idle run for
+    # zero benefit on those runs.
     #
     # Fix: a lightweight LOCAL pre-check, mirroring webhook.py's
-    # check_spread_bracket() (same HIGH/LOW touch check, same SL-wins
-    # tie-break), used ONLY to decide whether it's worth fetching the
-    # hedge price this run. This never overrides or duplicates the
-    # actual decision -- webhook.py's check_spread_bracket() remains the
-    # single authoritative source of truth for whether the position
-    # actually closes. Worst case if this local mirror ever drifts out
-    # of sync with webhook.py's real logic: hedge_current_price is
-    # occasionally None on an actual close (P&L logged as incomplete for
-    # that one trade, exit itself unaffected) or fetched once
-    # unnecessarily on a run that turns out not to close -- neither
-    # case blocks or delays the real exit decision, which is why the
-    # webhook call itself is now issued immediately, before this fetch,
-    # rather than after it.
+    # check_spread_bracket() SL-touch reasoning, used ONLY to decide
+    # whether it's worth fetching the hedge price this run. This never
+    # overrides or duplicates the actual decision -- webhook.py's
+    # check_spread_bracket() remains the single authoritative source of
+    # truth for whether the position actually closes.
+    #
+    # NEW (2026-09-15): target is dropped from this pre-check entirely --
+    # bracket_likely_hit is now SL-touch only (candle_high >= sl_price).
+    # Previously this also checked candle_low <= target_price; that half
+    # is removed since target no longer decides anything on this side.
+    # See this function's docstring for the KNOWN CROSS-REPO GAP note on
+    # target_price still being sent to (and possibly still evaluated by)
+    # the webhook server.
     candle_high = float(last["high"])
     candle_low = float(last["low"])
-    sl_price = pos["sl_price"]
-    target_price = pos["target_price"]
-    bracket_likely_hit = (candle_high >= sl_price) or (candle_low <= target_price)
+    bracket_likely_hit = candle_high >= sl_price
 
     hedge_current_price = None
     if bracket_likely_hit:
@@ -220,7 +273,7 @@ def manage_spread_exit(state, pos, instruments, expiry, smart_api, prev_day, pre
         "candle_high": candle_high,
         "candle_low": candle_low,
         "sl_price": sl_price,
-        "target_price": target_price,
+        "target_price": pos["target_price"],
         "hedge_current_price": hedge_current_price,
         "entry_price": pos["entry_price"],
         "hedge_entry_price": pos.get("hedge_entry_price"),
