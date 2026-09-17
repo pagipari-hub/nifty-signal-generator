@@ -1,26 +1,43 @@
 {
   "open_position": null,
-  "last_run": "2026-09-17T09:25:38.774242+05:30",
+  "last_run": "2026-09-17T09:31:54.317976+05:30",
   "heartbeat_date": "2026-09-17",
-  "daily_strikes_date": "2026-09-16",
-  "daily_atm": 23200,
+  "daily_strikes_date": "2026-09-17",
+  "daily_atm": 23250,
   "daily_strikes": [
     {
-      "sell_strike": 23100,
-      "hedge_strike": 22800,
+      "sell_strike": 23150,
+      "hedge_strike": 22850,
       "option_type": "PE"
     },
     {
-      "sell_strike": 23300,
-      "hedge_strike": 23600,
+      "sell_strike": 23350,
+      "hedge_strike": 23650,
       "option_type": "CE"
     }
   ],
-  "pending_signal": null,
+  "pending_signal": {
+    "sell_symbol": "NIFTY22SEP2623150PE",
+    "sell_token": "56979",
+    "sell_strike": 23150,
+    "hedge_symbol": "NIFTY22SEP2622850PE",
+    "hedge_token": "56936",
+    "hedge_strike": 22850,
+    "option_type": "PE",
+    "qty": 65,
+    "entry_limit": 85.0,
+    "sl_price": 96.0,
+    "target_price": 63.0,
+    "trigger_time": "2026-09-17T09:31:54.288565+05:30",
+    "candles_waited": 0,
+    "signal_source": "pdl",
+    "pdl": 93.55,
+    "hedge_entry_price": 25.4
+  },
   "pending_buy_signal": null,
   "open_buy_position": null,
   "daily_pdl": {
-    "PE": null,
-    "CE": 103.5
+    "PE": 93.55,
+    "CE": 88.0
   }
 }
