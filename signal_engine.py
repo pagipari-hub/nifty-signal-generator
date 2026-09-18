@@ -10,7 +10,7 @@ from market_data import get_candles_with_cache
 from indicators import compute_indicators, compute_squeeze_metrics
 from logging_utils import log_signal_debug
 from config import SELL_SQUEEZE_SPREAD_ATR_MIN, SELL_SCAN_CUTOFF_TIME
-from calendar_utils import is_before_sell_scan_cutoff
+from calendar_utils import is_before_sell_scan_cutoff, now_ist
 
 # NOTE: compute_pending_signal is imported lazily inside
 # scan_for_new_signal() below, not at module level. pending.py's
@@ -97,6 +97,12 @@ def _is_fresh_pdl_breakdown_signal(df, pdl):
     is_fresh_crossover_signal()'s own 2026-07-07 fix addressed for the
     EMA/VWAP side.
 
+    NOTE: this is still only a candle-to-candle transition check -- it
+    does NOT by itself guarantee "first breakdown of the session". See
+    _reset_pdl_fired_state_if_new_day() and its use in
+    scan_for_new_signal() below for the once-per-session guard that
+    wraps this.
+
     pdl=None (leg failed the PDL_MIN_PREV_DAY_VOLUME quality gate at
     lock time, or previous-day data wasn't available this run) always
     returns False -- PDL fallback is simply unavailable for that leg
@@ -108,6 +114,30 @@ def _is_fresh_pdl_breakdown_signal(df, pdl):
     current_below = df.iloc[-1]["close"] < pdl
     previous_below = df.iloc[-2]["close"] < pdl
     return current_below and not previous_below
+
+
+def _reset_pdl_fired_state_if_new_day(state):
+    """
+    NEW (fix: PDL fallback should only fire ONCE per session, not on
+    every candle-to-candle re-cross -- Pragnesh's call: "PDL should
+    only be valid if today's low never broke this before"). 
+
+    _is_fresh_pdl_breakdown_signal() above only checks the immediately
+    preceding candle (transition-based), so if price dips below PDL,
+    bounces back above, then dips again later the same day, it re-fires
+    as a "fresh" breakdown each time -- which was never the intent.
+
+    state["pdl_fired"] is a date-scoped dict (e.g. {"CE": True}),
+    mirroring instrument.get_or_set_daily_strikes()'s own
+    daily_strikes_date reset pattern. Reset to {} the moment the stored
+    date no longer matches today -- called once per run, before either
+    leg is checked, so every run this session sees a consistent,
+    already-reset dict regardless of which leg it looks at first.
+    """
+    today_str = now_ist().date().isoformat()
+    if state.get("pdl_fired_date") != today_str:
+        state["pdl_fired_date"] = today_str
+        state["pdl_fired"] = {}
 
 
 def scan_for_new_signal(state, leg_pairs, instruments, expiry, smart_api, prev_day, prev_day_cache, today_start, run_cache=None):
@@ -179,11 +209,20 @@ def scan_for_new_signal(state, leg_pairs, instruments, expiry, smart_api, prev_d
     Does NOT affect manage_pending_signal() or manage_spread_exit() /
     manage_legacy_single_leg_exit() -- those are never routed through
     this function and keep running every cycle regardless of time.
+
+    NEW (fix: PDL once-per-session guard): a fresh PDL breakdown is now
+    ALSO required to not have already fired earlier today for that
+    option_type (state["pdl_fired"]) -- see
+    _reset_pdl_fired_state_if_new_day()'s docstring for the root-cause
+    writeup (the transition check alone can re-fire on a later
+    bounce-and-redip within the same session, which was never the
+    intent). Does not affect the EMA/VWAP path at all.
     """
     from pending import compute_pending_signal, compute_pending_signal_pdl  # local import -- see NOTE at top of file
 
     daily_pdl = state.get("daily_pdl") or {}
     within_sell_scan_cutoff = is_before_sell_scan_cutoff()
+    _reset_pdl_fired_state_if_new_day(state)  # NEW -- see function docstring
 
     for leg in leg_pairs:
         sell_token_info = ac.resolve_option_token(instruments, expiry, leg["sell_strike"], leg["option_type"])
@@ -275,13 +314,22 @@ def scan_for_new_signal(state, leg_pairs, instruments, expiry, smart_api, prev_d
             )
             return
 
-        elif _is_fresh_pdl_breakdown_signal(df, daily_pdl.get(leg["option_type"])):
+        elif (
+            not state["pdl_fired"].get(leg["option_type"])
+            and _is_fresh_pdl_breakdown_signal(df, daily_pdl.get(leg["option_type"]))
+        ):
             # NEW (2026-08-13, PDL fallback entry): only reached when
             # EMA/VWAP did NOT fire for this leg this run (EMA/VWAP
             # always has priority on a same-run collision -- see
             # scan_for_new_signal()'s own docstring above).
+            #
+            # NEW (fix: once-per-session guard): also requires this
+            # option_type to NOT have already had a PDL breakdown fire
+            # earlier today (state["pdl_fired"]) -- see
+            # _reset_pdl_fired_state_if_new_day()'s docstring for why the
+            # transition-based check alone could re-fire on a later
+            # bounce-and-redip within the same session.
             pdl = daily_pdl.get(leg["option_type"])
-
             if not within_sell_scan_cutoff:
                 print(
                     f"PDL breakdown on {sell_token_info['symbol']} blocked -- at/after "
@@ -314,6 +362,12 @@ def scan_for_new_signal(state, leg_pairs, instruments, expiry, smart_api, prev_d
 
             state["pending_signal"] = compute_pending_signal_pdl(trigger_candle, sell_leg_info, hedge_leg_info, qty, pdl)
             state["pending_signal"]["hedge_entry_price"] = hedge_entry_price
+            # NEW (fix: once-per-session guard): mark fired the moment
+            # the signal is CREATED -- not on fill -- so even a signal
+            # that later cancels/expires unfilled still counts as "PDL
+            # already used today" for this option_type. See
+            # _reset_pdl_fired_state_if_new_day()'s docstring.
+            state["pdl_fired"][leg["option_type"]] = True
             p = state["pending_signal"]
             print(f"PENDING SIGNAL [PDL breakdown]: SELL {p['sell_symbol']} resting limit @ "
                   f"{p['entry_limit']:.2f} (SL={p['sl_price']:.2f}, target={p['target_price']:.2f}, "
