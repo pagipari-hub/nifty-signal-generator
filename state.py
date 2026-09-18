@@ -37,6 +37,18 @@ def load_state():
         # PDL_MIN_PREV_DAY_VOLUME quality gate -- PDL fallback is simply
         # skipped for that leg for the day in either case.
         "daily_pdl": None,
+        # NEW (fix: PDL should only fire once per session, not on every
+        # candle-to-candle re-cross -- Pragnesh's call): date-scoped,
+        # mirrors daily_strikes_date's own reset pattern. pdl_fired
+        # tracks which option_type(s) ("CE"/"PE") have already had a PDL
+        # breakdown signal FIRE today -- set True the moment such a
+        # signal is created (not on fill), so a signal that later
+        # cancels/expires unfilled still counts as "already used" for
+        # the rest of that day. Reset to {} by
+        # signal_engine._reset_pdl_fired_state_if_new_day() the first
+        # time pdl_fired_date no longer matches today.
+        "pdl_fired_date": None,
+        "pdl_fired": {},
     }
 
 
