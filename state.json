@@ -20,7 +20,7 @@
     "entry_time": "2026-09-28T09:46:31.003892+05:30",
     "signal_source": "ema_vwap"
   },
-  "last_run": "2026-09-28T14:05:50.475051+05:30",
+  "last_run": "2026-09-28T14:10:45.718376+05:30",
   "heartbeat_date": "2026-09-28",
   "daily_strikes_date": "2026-09-28",
   "daily_atm": 22900,
@@ -37,7 +37,19 @@
     }
   ],
   "pending_signal": null,
-  "pending_buy_signal": null,
+  "pending_buy_signal": {
+    "buy_symbol": "NIFTY06OCT2622800PE",
+    "buy_token": "40716",
+    "strike": 22800,
+    "option_type": "PE",
+    "qty": 65,
+    "entry_limit": 145.0,
+    "sl_price": 138.0,
+    "target_price": 152.0,
+    "risk": 7.0,
+    "trigger_time": "2026-09-28T14:10:45.718340+05:30",
+    "candles_waited": 0
+  },
   "open_buy_position": {
     "symbol": "NIFTY06OCT2622800PE",
     "token": "40716",
