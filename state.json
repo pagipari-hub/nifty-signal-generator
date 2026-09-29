@@ -15,12 +15,12 @@
     "qty": 65,
     "entry_price": 143.5,
     "hedge_entry_price": 52.7,
-    "sl_price": 171.5,
+    "sl_price": 169.0,
     "target_price": 92.5,
     "entry_time": "2026-09-29T09:45:53.304178+05:30",
     "signal_source": "ema_vwap"
   },
-  "last_run": "2026-09-29T10:01:56.340132+05:30",
+  "last_run": "2026-09-29T10:05:39.601333+05:30",
   "heartbeat_date": "2026-09-29",
   "daily_strikes_date": "2026-09-29",
   "daily_atm": 22650,
@@ -37,19 +37,7 @@
     }
   ],
   "pending_signal": null,
-  "pending_buy_signal": {
-    "buy_symbol": "NIFTY06OCT2622550PE",
-    "buy_token": "40700",
-    "strike": 22550,
-    "option_type": "PE",
-    "qty": 65,
-    "entry_limit": 115.5,
-    "sl_price": 98.0,
-    "target_price": 133.0,
-    "risk": 17.5,
-    "trigger_time": "2026-09-29T09:35:48.190803+05:30",
-    "candles_waited": 4
-  },
+  "pending_buy_signal": null,
   "open_buy_position": null,
   "daily_pdl": {
     "PE": null,
