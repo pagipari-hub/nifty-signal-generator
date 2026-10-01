@@ -9,7 +9,7 @@ import datetime as dt
 import pandas as pd
 
 from calendar_utils import now_ist
-from config import BUY_ROC_PERIOD, SUPERTREND_ATR_PERIOD, SUPERTREND_MULTIPLIER
+from config import SUPERTREND_ATR_PERIOD, SUPERTREND_MULTIPLIER
 
 
 CANDLE_WINDOW_SECONDS = 300  # 5-minute candles
@@ -26,33 +26,10 @@ def _drop_unclosed_last_candle(df):
     (e.g. a candle labelled 09:30:00, covering 09:30:00-09:34:59) as if it
     were closed, with its OHLCV still changing between calls.
 
-    Confirmed on the 2026-07-17 09:31-09:32 IST run: token 57345's
-    "09:30:00" candle was fetched three times within ~7 seconds by this
-    single run (once via candle_priming's prime call, twice via
-    scan_for_new_signal's own fetch) and returned a DIFFERENT close each
-    time (96.55, then 97.00) -- elapsed_since_open was only ~132s at
-    evaluation time, well under the 300s a closed candle requires. The
-    fresh-crossover signal that fired or a resting entry_limit locked off
-    that candle's EMA5 would both have been computed against a moving
-    target, not a stable reference point -- compute_pending_signal()'s own
-    docstring assumes entry_limit is computed "at candle-N-close time",
-    which this violated.
-
     Fix: after restricting to today's candles, check the LAST row's own
     elapsed-since-open. If it's under CANDLE_WINDOW_SECONDS, that candle
     is still forming -- drop it. Every caller (signal checks, EMA5/EMA25,
     entry_limit/SL/target) then only ever sees genuinely closed candles.
-    A dropped candle simply isn't available yet this run; it will appear
-    (closed) on the next run once its window has actually elapsed, same
-    as a normal 5-min cadence.
-
-    Uses the same elapsed-time math as the existing raw-candle debug
-    block (naive datetime comparison on IST wall-clock components) so
-    this stays consistent with what's already being logged. Wrapped
-    defensively: if anything about the last row is malformed, the
-    original df is returned unchanged rather than raising -- this must
-    never be able to crash a run managing a live position over a
-    formatting issue.
     """
     if df.empty:
         return df
@@ -85,10 +62,7 @@ def _compute_supertrend(df, period, multiplier):
     Supertrend(period, multiplier) computation. Adds four columns:
       - atr_<period>   -- Wilder-smoothed ATR at THIS period (deliberately
                            separate from the module-level ATR_PERIOD=14
-                           used by compute_squeeze_metrics(); reusing that
-                           one would silently change squeeze-diagnostic
-                           values too, see config.SUPERTREND_ATR_PERIOD's
-                           docstring)
+                           used by compute_squeeze_metrics()).
       - st_upper        -- the "final upper band" series. For a SHORT
                             position this is the relevant trailing-SL
                             candidate (resistance above price) -- see
@@ -98,26 +72,17 @@ def _compute_supertrend(df, period, multiplier):
       - st_lower        -- the "final lower band" series (not currently
                             consumed anywhere -- sell side only uses
                             st_upper -- but computed for symmetry/future
-                            use, e.g. if this is ever extended to the buy
-                            side).
+                            use).
       - supertrend / supertrend_direction -- the standard flip-based
                             Supertrend line + direction (+1 up, -1 down).
                             Not currently used for any entry/exit decision
-                            (Pragnesh's call: trailing SL only, no
-                            flip-based exit) -- computed for visibility/
-                            future use only.
+                            -- computed for visibility/future use only.
 
-    Must run on the FULL multi-day history passed in (same warm-up
-    pattern as EMA5/EMA25/ATR(14)/ROC elsewhere in this module) -- the
-    final-band recurrence needs several candles of lookback to be
-    meaningful, and restricting to today-only candles first would give a
-    cold-start band on the very first candles of each session.
-
+    Must run on the FULL multi-day history passed in -- the final-band
+    recurrence needs several candles of lookback to be meaningful.
     Implemented as an explicit Python loop rather than a vectorized
     pandas operation -- the final_upper/final_lower recurrence depends on
-    each row's own previous value, which doesn't vectorize cleanly. Candle
-    volumes here (a few hundred rows per day of multi-day history) make
-    this a non-issue performance-wise.
+    each row's own previous value.
     """
     if df.empty:
         df["st_upper"] = []
@@ -206,16 +171,7 @@ def compute_indicators(candles):
     # smoothing (ewm with alpha=1/period), same full-history warmup
     # pattern as EMA5/EMA25 above -- computed BEFORE the today-filter so
     # early-morning candles still get a warmed-up value from the prior
-    # session's tail, exactly like EMA5/EMA25 already do. True range
-    # needs the prior candle's close; the very first row in the whole
-    # fetched history has no prior close, so its tr2/tr3 are NaN and
-    # pandas' row-wise max() falls back to tr1 (high-low) for that one
-    # row only -- not a problem in practice since that row is always
-    # from well before today given the multi-day candle history fetched.
-    # Purely additive: nothing below reads df["atr"] yet, this just makes
-    # it available for the squeeze-metrics diagnostics being logged from
-    # buy_signal_engine.py while real threshold values are gathered from
-    # paper-mode data (no signal is gated on this yet).
+    # session's tail, exactly like EMA5/EMA25 already do.
     prev_close = df["close"].shift(1)
     tr = pd.concat(
         [
@@ -227,30 +183,8 @@ def compute_indicators(candles):
     ).max(axis=1)
     df["atr"] = tr.ewm(alpha=1 / ATR_PERIOD, adjust=False).mean()
 
-    # NEW (2026-09-04, buy-engine ROC replacement): ROC(BUY_ROC_PERIOD),
-    # standard percent rate-of-change on close --
-    # (close - close[N periods ago]) / close[N periods ago] * 100 --
-    # mirroring TradingView's own ROC indicator (same formula, same
-    # default length=18 in the settings Pragnesh shared). Computed BEFORE
-    # the today-filter, same full-history warmup pattern as EMA5/EMA25/ATR
-    # above, so the first candles of the session already have a real
-    # (non-NaN) ROC value seeded from the prior day's tail instead of
-    # needing 18 fresh candles after market open before the buy engine
-    # can fire at all. This REPLACES the EMA5/EMA25/VWAP crossover as the
-    # buy engine's entry trigger -- see buy_signal_engine.py's
-    # is_fresh_crossover_signal_buy() for the actual condition (ROC
-    # crosses above BUY_ROC_CROSS_LEVEL, price above VWAP). EMA5/EMA25
-    # are left in place above, still used by the SELL side and by the
-    # squeeze diagnostics -- this is purely additive, no existing column
-    # touched or removed.
-    df["roc"] = (
-        (df["close"] - df["close"].shift(BUY_ROC_PERIOD))
-        / df["close"].shift(BUY_ROC_PERIOD)
-        * 100
-    )
-
     # NEW (2026-09-15, sell-side trailing Supertrend SL): computed on the
-    # FULL multi-day history, same warm-up reasoning as ATR(14)/EMA/ROC
+    # FULL multi-day history, same warm-up reasoning as ATR(14)/EMA
     # above -- see _compute_supertrend()'s docstring for the full
     # writeup. Uses its OWN atr_10 column, deliberately separate from
     # df["atr"] (14) above, which squeeze diagnostics depend on and must
@@ -266,11 +200,9 @@ def compute_indicators(candles):
     df = df[today_mask].reset_index(drop=True)
 
     # FIX (2026-07-17): drop the last candle if its own window hasn't
-    # closed yet -- see _drop_unclosed_last_candle() docstring above for
-    # the full root-cause writeup. Must happen AFTER the today-filter
-    # (so we're checking the actual latest today-candle) and BEFORE the
-    # len(df) < 2 check below (an unclosed candle shouldn't count toward
-    # "do we have enough data").
+    # closed yet -- see _drop_unclosed_last_candle() docstring above.
+    # Must happen AFTER the today-filter (so we're checking the actual
+    # latest today-candle) and BEFORE the len(df) < 2 check below.
     df = _drop_unclosed_last_candle(df)
 
     if len(df) < 2:
@@ -292,16 +224,9 @@ def compute_indicators(candles):
     # DEBUG (temporary, 2026-07-07 -- investigating possible partial/still-
     # forming candle from Angel One): print the raw time+OHLCV for the last
     # few candles, plus whether each candle's own 5-min window has actually
-    # elapsed by wall-clock "now". A candle labeled e.g. 10:35:00 covers
-    # 10:35:00-10:39:59; if this run's now_ist is still inside that window
-    # (elapsed_seconds < 300), the row's close/high/low/volume may still be
-    # changing mid-candle, and Angel One may be returning that in-progress
-    # bar as if it were closed. Read-only -- does not change df (as of
-    # 2026-07-17, the unclosed LAST candle is already dropped above; this
-    # block now mainly documents the window-elapsed state of the remaining
-    # closed candles for audit purposes), does not affect any decision.
-    # Wrapped defensively so a formatting issue here can never block a
-    # real run managing live positions.
+    # elapsed by wall-clock "now". Read-only. Wrapped defensively so a
+    # formatting issue here can never block a real run managing live
+    # positions.
     try:
         n = now_ist()
         tail = df.tail(4)
@@ -309,9 +234,6 @@ def compute_indicators(candles):
               file=sys.stderr)
         for _, row in tail.iterrows():
             candle_time = row["time"]
-            # candle_time is tz-naive (from pd.to_datetime on Angel One's
-            # string); compare wall-clock elapsed against the naive IST
-            # clock components only, avoiding a tz-aware/naive subtraction.
             candle_dt_naive = dt.datetime.combine(candle_time.date(), candle_time.time())
             now_naive = dt.datetime.combine(n.date(), n.time())
             elapsed_seconds = (now_naive - candle_dt_naive).total_seconds()
@@ -331,7 +253,7 @@ def compute_indicators(candles):
 
 def compute_squeeze_metrics(row):
     """
-    NEW (2026-07-30, diagnostic only -- does not gate any signal yet).
+    NEW (2026-07-30, diagnostic + sell-side gate support).
 
     How tightly EMA5/EMA25/VWAP are bunched together on a given
     indicator row -- the working theory (Pragnesh, 2026-07-30) is that
@@ -342,41 +264,26 @@ def compute_squeeze_metrics(row):
     also when EMA5/VWAP tend to whipsaw back and forth, producing
     repeated low-conviction "fresh crossovers" rather than one clean one.
 
-    NOTE (2026-09-04): this diagnostic is still computed and logged from
-    buy_signal_engine.py's scan loops even though the buy engine's actual
-    entry trigger no longer uses EMA5/EMA25 (replaced by ROC -- see
-    indicators.py's ROC block and buy_signal_engine.py's
-    is_fresh_crossover_signal_buy()). Left unconditional/as-is: it costs
-    nothing extra to keep logging it, and it remains meaningful for the
-    SELL side, which still gates on it via SELL_SQUEEZE_SPREAD_ATR_MIN.
+    Used by:
+      - logging_utils.log_signal_debug()'s [squeeze diag] line (always
+        logged, fire or no-fire, sell side)
+      - signal_engine.scan_for_new_signal()'s sell-side squeeze gate
+        (SELL_SQUEEZE_SPREAD_ATR_MIN)
 
     NOTE (2026-09-15): deliberately still reads row["atr"] -- the
     ATR(14) column -- NOT the new row["atr_10"] added for Supertrend.
     These are two independent ATR series at different periods; squeeze
     diagnostics must keep using the same ATR(14) they've always used, so
-    historical spread_atr_ratio values stay comparable across this
-    change.
+    historical spread_atr_ratio values stay comparable.
 
     Returns (spread, spread_pct, spread_atr_ratio):
       - spread           = max(ema5, ema25, vwap) - min(ema5, ema25, vwap)
       - spread_pct       = spread / vwap * 100 -- scale-invariant across
-                            different strikes/premium levels/days, so a
-                            fixed threshold means roughly the same thing
-                            regardless of whether the premium is Rs. 40
-                            or Rs. 400.
+                            different strikes/premium levels/days.
       - spread_atr_ratio = spread / atr -- how tight the bunching is
                             RELATIVE to how much this specific option's
                             premium is actually moving right now. None if
-                            ATR isn't available yet (e.g. very first
-                            candles of the whole fetched history) or is
-                            zero, since dividing by it would be
-                            meaningless.
-
-    No thresholds are applied here on purpose -- the plan is to log
-    these values during paper trading first (see buy_signal_engine.py's
-    scan debug output) and pick real cutoffs from what a squeeze vs. a
-    clean signal actually look like in this specific data, rather than
-    guessing numbers with no premium-level calibration behind them.
+                            ATR isn't available yet or is zero.
     """
     values = [row["ema5"], row["ema25"], row["vwap"]]
     spread = max(values) - min(values)
