@@ -4,7 +4,6 @@ NIFTY weekly options strategy runner -- DATA + SIGNAL GENERATION ONLY.
 Runs on GitHub Actions every 5 min during market hours.
 1. Logs into Angel One (data APIs only, no static IP needed)
 2. Resolves ATM +-2 CE/PE strikes via the official instrument master JSON
-   (never guesses the symbol format)
 3. Fetches 5-min candles, computes EMA5/EMA25/VWAP
 4. Checks entry signal; if found, computes entry/SL/target
 5. POSTs the signal to the webhook (which holds the Shoonya session and
@@ -34,11 +33,6 @@ from instrument import get_or_set_daily_strikes
 from signal_engine import scan_for_new_signal
 from pending import manage_pending_signal
 from position import manage_legacy_single_leg_exit, manage_spread_exit
-from buy_signal_engine import (
-    manage_open_buy_position_live,
-    manage_pending_buy_signal_live,
-    scan_for_new_buy_signal_live,
-)
 from webhook import send_heartbeat_if_needed, send_strike_lock_alert
 from candle_priming import prime_candle_cache, lock_daily_pdl
 from config import STRIKE_LOCK_TIME
@@ -109,25 +103,11 @@ def main():
         # loaded/saved to disk further down and only ever covers the
         # PREVIOUS day) -- this is purely in-memory, purely for THIS
         # run, and exists so that if two different functions in the same
-        # run (e.g. the sell scan and the buy scan) both need the same
-        # token's candles, only the first actually hits the network; the
-        # second gets the identical result from here at zero extra cost.
-        # See market_data.get_candles_with_cache()'s docstring for the
-        # full root-cause writeup (confirmed via a 2026-07-28 live run
-        # log showing the same token fetched twice, seconds apart).
+        # run both need the same token's candles, only the first
+        # actually hits the network; the second gets the identical
+        # result from here at zero extra cost.
         run_candle_cache = {}
 
-        # FIX (2026-07-10, session-per-run root cause): was ac.login() --
-        # a full TOTP-based generateSession() on every single run, every
-        # 5 minutes, all day. ac.login_with_cache() reuses a cached
-        # session (angel_session.json, restored via GH Actions cache --
-        # see signal_generator.yml) via the lightweight
-        # generateToken(refresh_token) renewal when one exists for today,
-        # and only falls back to a full TOTP login otherwise. See
-        # angelone_client.py's login_with_cache() docstring for the full
-        # root-cause writeup (2026-07-10 case study: CE leg candle fetch
-        # failing outright on the first data call right after a fresh
-        # login, both at 09:35 and 09:45).
         smart_api = ac.login_with_cache()
         instruments = ac.download_instrument_master()
 
@@ -143,17 +123,7 @@ def main():
 
         # FIX (moved up, 2026-07-15): prev_day / prev_day_cache / today_start
         # now need to exist BEFORE the strike-lock block below, since
-        # prime_candle_cache() (called only on the run that just performed
-        # the lock) needs them to warm up the two sell legs' candle cache
-        # immediately after lock -- see candle_priming.py's docstring for
-        # why this is a dedicated step rather than just waiting for
-        # scan_for_new_signal() to hit the same fetch later in this run.
-        # Root cause this addresses: 2026-07-15 case study, where token
-        # 57345's prev-day fetch was rate-limited on both the 9:31 and
-        # 9:35 runs (each already loaded with a full TOTP re-login just
-        # before it), leaving EMA25 computed with zero previous-day
-        # warm-up (136.51 vs. an expected ~188) and blocking what should
-        # have been a live entry signal on the PE leg both times.
+        # prime_candle_cache() needs them -- see candle_priming.py's docstring.
         prev_day = previous_trading_day(now_ist().date())
         prev_day_cache = load_prev_day_cache(prev_day)
         today_start = dt.datetime.combine(now_ist().date(), MARKET_OPEN)
@@ -172,16 +142,6 @@ def main():
 
         save_state(state)
 
-        # ---- Buy-side: check open buy position EVERY run, regardless of ----
-        # ---- what the sell side is doing this run (Pragnesh's call: a ----
-        # ---- live buy position is always monitored, no exceptions -- ----
-        # ---- unlike buy signal scanning/pending management below, which ----
-        # ---- only runs when the sell side has nothing to do this run). ----
-        if state.get("open_buy_position") is not None:
-            manage_open_buy_position_live(state, instruments, expiry, smart_api, prev_day, prev_day_cache, today_start, run_candle_cache)
-            save_state(state)
-            save_prev_day_cache(prev_day, prev_day_cache)
-
         # ---- Manage existing open position first ----
         if state["open_position"] is not None:
             pos = state["open_position"]
@@ -191,93 +151,40 @@ def main():
                 # FIX (backward compatibility): a position opened before this
                 # rework has no "spread" key -- it must keep being managed by
                 # the OLD dynamic-SL, single-leg exit logic untouched, not the
-                # new fixed-SL spread logic. See position.manage_legacy_single_leg_exit().
+                # new fixed-SL spread logic.
                 manage_legacy_single_leg_exit(state, pos, instruments, expiry, smart_api, prev_day, prev_day_cache, today_start, run_candle_cache)
 
             save_state(state)
             save_prev_day_cache(prev_day, prev_day_cache)
+            return
 
-            # FIX (2026-07-31, missed-CE-while-PE-open bug): previously
-            # returned here, which blocked buy-side scanning ENTIRELY
-            # whenever sell had ANY open position -- even on a completely
-            # different strike/option_type. Confirmed via real paper data
-            # (2026-07-31): PE 24250 sell position open and working while
-            # CE 24450 ran 52 -> 70+ in the same window, and the buy engine
-            # never got a chance to scan it, because this return exited the
-            # whole run before scan_for_new_buy_signal_live() was ever
-            # reached. scan_for_new_buy_signal_live()'s own per-strike guard
-            # (_strike_has_open_sell_position()) already correctly scopes
-            # the block to just the SAME strike sell is holding -- it was
-            # simply unreachable behind this coarser early return. Falling
-            # through instead of returning lets the OTHER strike still be
-            # scanned/traded, at the cost of one extra candle fetch this
-            # run (the non-conflicting strike) -- no worse than a normal
-            # no-position run, which already fetches both legs (see
-            # scan_for_new_signal()'s per-leg loop below).
-            #
-            # Deliberately does NOT fall through to scan_for_new_signal()
-            # below (that stays inside the "no open position" branch) --
-            # sell already had its turn managing the open position this
-            # run; this only skips the early return, not the
-            # already-correct "don't also scan for a NEW sell entry while
-            # one's still open" rule.
-        else:
-            # ---- No open position: manage a resting pending_signal, if any ----
-            if state.get("pending_signal") is not None:
-                pending = state["pending_signal"]
+        # ---- No open position: manage a resting pending_signal, if any ----
+        if state.get("pending_signal") is not None:
+            pending = state["pending_signal"]
 
-                # FIX (2026-07-24): validate the resting signal actually belongs
-                # to TODAY's currently-locked leg_pairs before trusting it --
-                # see _pending_signal_matches_locked_legs() docstring above for
-                # the full root-cause writeup. A mismatch means this
-                # pending_signal is stale (left over from an earlier ATM lock
-                # that was never cleared) and must be discarded, never filled.
-                if not _pending_signal_matches_locked_legs(pending, leg_pairs):
-                    print(
-                        f"[STALE PENDING_SIGNAL] {pending.get('sell_symbol', '?')} "
-                        f"(sell_strike={pending.get('sell_strike')}, option_type={pending.get('option_type')}) "
-                        f"does not match any leg in today's locked leg_pairs ({leg_pairs}) -- "
-                        "discarding without filling or managing it, and continuing to scan fresh this run.",
-                        file=sys.stderr,
-                    )
-                    state["pending_signal"] = None
-                    # Deliberately fall through to scan_for_new_signal() below in
-                    # this SAME run, rather than return -- a stale signal being
-                    # discarded shouldn't cost this run its chance to catch a
-                    # genuine fresh crossover on today's real leg_pairs.
-                else:
-                    manage_pending_signal(state, instruments, expiry, smart_api, prev_day, prev_day_cache, today_start, run_candle_cache)
-                    save_state(state)
-                    save_prev_day_cache(prev_day, prev_day_cache)
-                    # UNCHANGED (2026-07-31): still returns here, deliberately
-                    # NOT given the same fall-through treatment as the open-
-                    # position branch above. Reason: _strike_has_open_sell_position()
-                    # (the guard scan_for_new_buy_signal_live() relies on) only
-                    # checks state["open_position"] -- it has no equivalent check
-                    # for a resting, not-yet-filled state["pending_signal"]. If
-                    # this fell through too, the buy scanner could open a
-                    # position on the exact same strike sell has an unfilled
-                    # resting SELL limit on, with nothing currently guarding
-                    # against that specific overlap. Left as a known follow-up,
-                    # not bundled into this fix.
-                    return
+            # FIX (2026-07-24): validate the resting signal actually belongs
+            # to TODAY's currently-locked leg_pairs before trusting it.
+            if not _pending_signal_matches_locked_legs(pending, leg_pairs):
+                print(
+                    f"[STALE PENDING_SIGNAL] {pending.get('sell_symbol', '?')} "
+                    f"(sell_strike={pending.get('sell_strike')}, option_type={pending.get('option_type')}) "
+                    f"does not match any leg in today's locked leg_pairs ({leg_pairs}) -- "
+                    "discarding without filling or managing it, and continuing to scan fresh this run.",
+                    file=sys.stderr,
+                )
+                state["pending_signal"] = None
+                # Deliberately fall through to scan_for_new_signal() below in
+                # this SAME run, rather than return -- a stale signal being
+                # discarded shouldn't cost this run its chance to catch a
+                # genuine fresh crossover on today's real leg_pairs.
+            else:
+                manage_pending_signal(state, instruments, expiry, smart_api, prev_day, prev_day_cache, today_start, run_candle_cache)
+                save_state(state)
+                save_prev_day_cache(prev_day, prev_day_cache)
+                return
 
-            # ---- No position, no (valid) pending signal: scan for a fresh entry trigger ----
-            scan_for_new_signal(state, leg_pairs, instruments, expiry, smart_api, prev_day, prev_day_cache, today_start, run_candle_cache)
-
-        # ---- Buy-side signal scanning/pending management ----
-        # UPDATED (2026-07-31): previously only reached when sell had NO
-        # open position and no valid pending signal this run. Now also
-        # reached when sell DOES have an open position (see the FIX note
-        # in the open-position branch above for why) -- scan_for_new_buy_signal_live()'s
-        # own per-strike guard handles the actual same-strike exclusion.
-        # Still NOT reached when sell has a valid resting pending_signal
-        # (that branch still returns early -- see its own note above for
-        # why that case is intentionally left alone for now).
-        if state.get("pending_buy_signal") is not None:
-            manage_pending_buy_signal_live(state, instruments, expiry, smart_api, prev_day, prev_day_cache, today_start, run_candle_cache)
-        else:
-            scan_for_new_buy_signal_live(state, leg_pairs, instruments, expiry, smart_api, prev_day, prev_day_cache, today_start, run_candle_cache)
+        # ---- No position, no (valid) pending signal: scan for a fresh entry trigger ----
+        scan_for_new_signal(state, leg_pairs, instruments, expiry, smart_api, prev_day, prev_day_cache, today_start, run_candle_cache)
 
         save_state(state)
         save_prev_day_cache(prev_day, prev_day_cache)
