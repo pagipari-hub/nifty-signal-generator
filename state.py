@@ -23,8 +23,6 @@ def load_state():
         "daily_atm": None,
         "daily_strikes": None,
         "pending_signal": None,
-        "pending_buy_signal": None,
-        "open_buy_position": None,
         # NEW (2026-08-13, PDL fallback entry): {"PE": <float or None>,
         # "CE": <float or None>}, written once per day by
         # candle_priming.lock_daily_pdl() on the same run that performs
