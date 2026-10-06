@@ -1,8 +1,8 @@
 {
   "open_position": null,
-  "last_run": "2026-10-06T09:25:30.819572+05:30",
+  "last_run": "2026-10-06T09:37:19.708948+05:30",
   "heartbeat_date": "2026-10-06",
-  "daily_strikes_date": "2026-10-05",
+  "daily_strikes_date": "2026-10-06",
   "daily_atm": 22600,
   "daily_strikes": [
     {
@@ -18,11 +18,9 @@
   ],
   "pending_signal": null,
   "daily_pdl": {
-    "PE": 141.45,
-    "CE": null
+    "PE": 119.25,
+    "CE": 107.0
   },
-  "pdl_fired_date": "2026-10-05",
-  "pdl_fired": {
-    "PE": true
-  }
+  "pdl_fired_date": "2026-10-06",
+  "pdl_fired": {}
 }
