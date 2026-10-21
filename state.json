@@ -1,6 +1,26 @@
 {
-  "open_position": null,
-  "last_run": "2026-10-21T11:46:28.514246+05:30",
+  "open_position": {
+    "spread": true,
+    "option_type": "CE",
+    "sell_leg": {
+      "symbol": "NIFTY27OCT2623050CE",
+      "token": "51354",
+      "strike": 23050
+    },
+    "hedge_leg": {
+      "symbol": "NIFTY27OCT2623350CE",
+      "token": "51366",
+      "strike": 23350
+    },
+    "qty": 65,
+    "entry_price": 91.0,
+    "hedge_entry_price": 29.0,
+    "sl_price": 116.0,
+    "target_price": 73.0,
+    "entry_time": "2026-10-21T11:51:28.449998+05:30",
+    "signal_source": "pdl"
+  },
+  "last_run": "2026-10-21T11:51:28.450029+05:30",
   "heartbeat_date": "2026-10-21",
   "daily_strikes_date": "2026-10-21",
   "daily_atm": 22950,
@@ -16,24 +36,7 @@
       "option_type": "CE"
     }
   ],
-  "pending_signal": {
-    "sell_symbol": "NIFTY27OCT2623050CE",
-    "sell_token": "51354",
-    "sell_strike": 23050,
-    "hedge_symbol": "NIFTY27OCT2623350CE",
-    "hedge_token": "51366",
-    "hedge_strike": 23350,
-    "option_type": "CE",
-    "qty": 65,
-    "entry_limit": 91.0,
-    "sl_price": 100.0,
-    "target_price": 73.0,
-    "trigger_time": "2026-10-21T11:46:28.514169+05:30",
-    "candles_waited": 0,
-    "signal_source": "pdl",
-    "pdl": 93.2,
-    "hedge_entry_price": 29.0
-  },
+  "pending_signal": null,
   "daily_pdl": {
     "PE": 67.8,
     "CE": 93.2
