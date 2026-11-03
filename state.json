@@ -1,26 +1,6 @@
 {
-  "open_position": {
-    "spread": true,
-    "option_type": "PE",
-    "sell_leg": {
-      "symbol": "NIFTY09NOV2623500PE",
-      "token": "39940",
-      "strike": 23500
-    },
-    "hedge_leg": {
-      "symbol": "NIFTY09NOV2623200PE",
-      "token": "39927",
-      "strike": 23200
-    },
-    "qty": 65,
-    "entry_price": 138.5,
-    "hedge_entry_price": 61.1,
-    "sl_price": 130.5,
-    "target_price": 109.5,
-    "entry_time": "2026-11-03T09:56:39.712710+05:30",
-    "signal_source": "ema_vwap"
-  },
-  "last_run": "2026-11-03T12:10:52.079954+05:30",
+  "open_position": null,
+  "last_run": "2026-11-03T12:15:59.714044+05:30",
   "heartbeat_date": "2026-11-03",
   "daily_strikes_date": "2026-11-03",
   "daily_atm": 23600,
