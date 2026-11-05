@@ -1,28 +1,26 @@
 {
   "open_position": null,
-  "last_run": "2026-11-05T09:25:24.679628+05:30",
+  "last_run": "2026-11-05T09:33:23.138360+05:30",
   "heartbeat_date": "2026-11-05",
-  "daily_strikes_date": "2026-11-04",
-  "daily_atm": 23900,
+  "daily_strikes_date": "2026-11-05",
+  "daily_atm": 24350,
   "daily_strikes": [
     {
-      "sell_strike": 23800,
-      "hedge_strike": 23500,
+      "sell_strike": 24250,
+      "hedge_strike": 23950,
       "option_type": "PE"
     },
     {
-      "sell_strike": 24000,
-      "hedge_strike": 24300,
+      "sell_strike": 24450,
+      "hedge_strike": 24750,
       "option_type": "CE"
     }
   ],
   "pending_signal": null,
   "daily_pdl": {
-    "PE": 212.3,
-    "CE": 25.2
+    "PE": null,
+    "CE": 10.8
   },
-  "pdl_fired_date": "2026-11-04",
-  "pdl_fired": {
-    "PE": true
-  }
+  "pdl_fired_date": "2026-11-05",
+  "pdl_fired": {}
 }
