@@ -1,26 +1,6 @@
 {
-  "open_position": {
-    "spread": true,
-    "option_type": "CE",
-    "sell_leg": {
-      "symbol": "NIFTY01DEC2625900CE",
-      "token": "47855",
-      "strike": 25900
-    },
-    "hedge_leg": {
-      "symbol": "NIFTY01DEC2626200CE",
-      "token": "47910",
-      "strike": 26200
-    },
-    "qty": 65,
-    "entry_price": 142.5,
-    "hedge_entry_price": 47.2,
-    "sl_price": 61.5,
-    "target_price": 119.5,
-    "entry_time": "2026-11-27T09:56:12.028103+05:30",
-    "signal_source": "ema_vwap"
-  },
-  "last_run": "2026-11-27T15:15:51.585524+05:30",
+  "open_position": null,
+  "last_run": "2026-11-27T15:20:45.866429+05:30",
   "heartbeat_date": "2026-11-27",
   "daily_strikes_date": "2026-11-27",
   "daily_atm": 25800,
